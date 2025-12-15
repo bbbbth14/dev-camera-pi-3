@@ -9,6 +9,7 @@ import sys
 import os
 import time
 from face_recognizer import FaceRecognizer
+from camera_wrapper import Camera
 import config
 
 
@@ -22,90 +23,92 @@ def capture_face_samples(name: str, num_samples: int = 5):
     """
     print(f"\n[INFO] Enrolling new face: {name}")
     print(f"[INFO] Will capture {num_samples} samples")
-    print("[INFO] Please look at the camera and press SPACE to capture each sample")
+    print("[INFO] Camera will capture automatically with 2 second intervals")
+    print("[INFO] Position yourself in front of the camera")
     
-    # Initialize camera
-    if config.USE_PI_CAMERA:
-        try:
-            from picamera2 import Picamera2
-            camera = Picamera2()
-            camera_config = camera.create_preview_configuration(
-                main={"size": (config.CAMERA_WIDTH, config.CAMERA_HEIGHT)}
-            )
-            camera.configure(camera_config)
-            camera.start()
-            print("[INFO] Using Pi Camera")
-            time.sleep(2)  # Warm up
-            use_pi_cam = True
-        except Exception as e:
-            print(f"[ERROR] Pi Camera failed: {e}")
-            print("[INFO] Falling back to USB camera")
-            camera = cv2.VideoCapture(0)
-            use_pi_cam = False
-    else:
-        camera = cv2.VideoCapture(0)
-        use_pi_cam = False
-        print("[INFO] Using USB camera")
+    # Initialize camera with preview
+    camera = Camera(config.CAMERA_WIDTH, config.CAMERA_HEIGHT, 
+                   config.USE_PI_CAMERA, preview=True)
     
-    # Initialize recognizer
+    if not camera.isOpened():
+        print("[ERROR] Failed to open camera")
+        return False
+    
+    # Initialize recognizer and face detector
     recognizer = FaceRecognizer()
+    from face_detector import FaceDetector
+    detector = FaceDetector()
     
     samples_captured = 0
     best_sample = None
     
-    print("\n[INFO] Camera ready. Press SPACE to capture, ESC to cancel")
+    # Create preview window
+    window_name = f"Enrolling: {name}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    
+    print(f"[INFO] Starting capture in 3 seconds...")
+    
+    # Show countdown
+    for i in range(3, 0, -1):
+        ret, frame = camera.read()
+        if ret and frame is not None:
+            display = frame.copy()
+            cv2.putText(display, f"Starting in {i}...", 
+                       (display.shape[1]//2 - 100, display.shape[0]//2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+            cv2.imshow(window_name, display)
+            cv2.waitKey(1000)
     
     while samples_captured < num_samples:
         # Capture frame
-        if use_pi_cam:
-            frame = camera.capture_array()
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        else:
-            ret, frame = camera.read()
-            if not ret:
-                print("[ERROR] Failed to capture frame")
-                break
+        ret, frame = camera.read()
         
-        # Display frame with instructions
-        display_frame = frame.copy()
-        cv2.putText(display_frame, f"Samples: {samples_captured}/{num_samples}", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(display_frame, "Press SPACE to capture", 
-                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        cv2.imshow('Enroll Face', display_frame)
-        
-        key = cv2.waitKey(1) & 0xFF
-        
-        if key == 27:  # ESC
-            print("\n[INFO] Enrollment cancelled")
+        if not ret or frame is None:
+            print("[ERROR] Failed to capture frame")
             break
-        elif key == 32:  # SPACE
-            print(f"[INFO] Capturing sample {samples_captured + 1}...")
-            
-            # Save sample image
-            sample_dir = os.path.join(config.IMAGES_DIR, name)
-            os.makedirs(sample_dir, exist_ok=True)
-            sample_path = os.path.join(sample_dir, f"sample_{samples_captured + 1}.jpg")
-            cv2.imwrite(sample_path, frame)
-            
-            # Try to encode the face
-            encoding = recognizer.encode_face(frame)
-            if encoding is not None:
-                samples_captured += 1
-                best_sample = frame
-                print(f"[SUCCESS] Sample {samples_captured} captured successfully")
-            else:
-                print("[ERROR] No face detected. Please try again.")
-            
-            time.sleep(0.5)  # Brief pause
+        
+        # Detect faces for preview
+        faces = detector.detect_faces(frame)
+        display_frame = frame.copy()
+        
+        # Draw face boxes
+        if len(faces) > 0:
+            for (x, y, w, h) in faces:
+                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        
+        # Add info overlay
+        cv2.putText(display_frame, f"Sample {samples_captured}/{num_samples}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, f"Enrolling: {name}", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Show preview
+        cv2.imshow(window_name, display_frame)
+        cv2.waitKey(100)
+        
+        print(f"[INFO] Capturing sample {samples_captured + 1}/{num_samples}...")
+        
+        # Save sample image
+        sample_dir = os.path.join(config.IMAGES_DIR, name)
+        os.makedirs(sample_dir, exist_ok=True)
+        sample_path = os.path.join(sample_dir, f"sample_{samples_captured + 1}.jpg")
+        cv2.imwrite(sample_path, frame)
+        
+        # Try to encode the face
+        encoding = recognizer.encode_face(frame)
+        if encoding is not None:
+            samples_captured += 1
+            best_sample = frame
+            print(f"[SUCCESS] Sample {samples_captured} captured successfully")
+        else:
+            print("[ERROR] No face detected. Please position yourself in front of camera.")
+        
+        if samples_captured < num_samples:
+            time.sleep(2)  # Wait 2 seconds between captures
     
     # Cleanup
     cv2.destroyAllWindows()
-    if use_pi_cam:
-        camera.stop()
-    else:
-        camera.release()
+    camera.release()
     
     # Add the best sample to database
     if best_sample is not None and samples_captured > 0:
@@ -125,7 +128,7 @@ def capture_face_samples(name: str, num_samples: int = 5):
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='Enroll a new face into the system')
-    parser.add_argument('--name', type=str, required=True, help='Name of the person')
+    parser.add_argument('--name', type=str, help='Name of the person')
     parser.add_argument('--samples', type=int, default=5, help='Number of samples to capture (default: 5)')
     parser.add_argument('--list', action='store_true', help='List all enrolled faces')
     parser.add_argument('--remove', type=str, help='Remove a face from database')
@@ -150,6 +153,10 @@ def main():
         else:
             print(f"[ERROR] Failed to remove {args.remove}")
         return
+    
+    # Enroll new face requires name
+    if not args.name:
+        parser.error("--name is required for enrollment")
     
     # Enroll new face
     capture_face_samples(args.name, args.samples)

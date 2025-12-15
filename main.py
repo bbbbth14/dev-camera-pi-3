@@ -11,6 +11,7 @@ from datetime import datetime
 from face_detector import FaceDetector
 from face_recognizer import FaceRecognizer
 from attendance_tracker import AttendanceTracker
+from camera_wrapper import Camera
 import config
 
 # GPIO control (optional)
@@ -101,43 +102,28 @@ class FaceRecognitionSystem:
         """Run the main recognition loop"""
         print(f"\n[INFO] Starting {self.mode.upper()} system...")
         print("[INFO] Press 'q' to quit, 's' to show summary")
+        print("[INFO] Live camera preview with face detection enabled")
         
-        # Initialize camera
-        if config.USE_PI_CAMERA:
-            try:
-                from picamera2 import Picamera2
-                camera = Picamera2()
-                camera_config = camera.create_preview_configuration(
-                    main={"size": (config.CAMERA_WIDTH, config.CAMERA_HEIGHT)}
-                )
-                camera.configure(camera_config)
-                camera.start()
-                print("[INFO] Using Pi Camera")
-                time.sleep(2)  # Warm up
-                use_pi_cam = True
-            except Exception as e:
-                print(f"[ERROR] Pi Camera failed: {e}")
-                print("[INFO] Falling back to USB camera")
-                camera = cv2.VideoCapture(0)
-                use_pi_cam = False
-        else:
-            camera = cv2.VideoCapture(0)
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-            use_pi_cam = False
-            print("[INFO] Using USB camera")
+        # Initialize camera using wrapper with preview enabled
+        camera = Camera(config.CAMERA_WIDTH, config.CAMERA_HEIGHT, 
+                       config.USE_PI_CAMERA, preview=True)
+        
+        if not camera.isOpened():
+            print("[ERROR] Failed to open camera")
+            return
+        
+        # Create window
+        window_name = f"Face Recognition - {self.mode.upper()} Mode"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         
         try:
             while True:
                 # Capture frame
-                if use_pi_cam:
-                    frame = camera.capture_array()
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                else:
-                    ret, frame = camera.read()
-                    if not ret:
-                        print("[ERROR] Failed to capture frame")
-                        break
+                ret, frame = camera.read()
+                
+                if not ret or frame is None:
+                    print("[ERROR] Failed to capture frame")
+                    break
                 
                 self.frame_count += 1
                 display_frame = frame.copy()
@@ -161,21 +147,20 @@ class FaceRecognitionSystem:
                             self.process_recognition(name, confidence)
                         
                         # Draw bounding boxes
-                        display_frame = self.detector.draw_faces(frame, faces, labels)
+                        display_frame = self.detector.draw_faces(display_frame, faces, labels)
                 
                 # Add system info overlay
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 cv2.putText(display_frame, f"Mode: {self.mode.upper()}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(display_frame, timestamp, 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(display_frame, "Press 'q' to quit, 's' for summary", 
+                cv2.putText(display_frame, "Press 'q' to quit | 's' for summary", 
                            (10, display_frame.shape[0] - 10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
-                # Show frame
-                if config.SHOW_PREVIEW:
-                    cv2.imshow('Face Recognition System', display_frame)
+                # Show frame with detections
+                cv2.imshow(window_name, display_frame)
                 
                 # Handle keyboard input
                 key = cv2.waitKey(1) & 0xFF
@@ -192,10 +177,7 @@ class FaceRecognitionSystem:
         finally:
             # Cleanup
             cv2.destroyAllWindows()
-            if use_pi_cam:
-                camera.stop()
-            else:
-                camera.release()
+            camera.release()
             
             if config.USE_GPIO:
                 GPIO.cleanup()

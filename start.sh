@@ -2,6 +2,11 @@
 
 # Quick start script for Face Recognition System
 
+# Activate virtual environment if it exists
+if [ -d "venv" ]; then
+    source venv/bin/activate
+fi
+
 echo "Face Recognition System - Quick Start"
 echo "====================================="
 echo ""

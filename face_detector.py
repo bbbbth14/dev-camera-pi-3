@@ -5,6 +5,9 @@ Handles real-time face detection using OpenCV
 
 import cv2
 import numpy as np
+import sys
+import os
+import time
 from typing import List, Tuple
 import config
 
@@ -99,54 +102,71 @@ if __name__ == "__main__":
     """Test the face detector"""
     print("[INFO] Testing face detector...")
     
+    from camera_wrapper import Camera
+    
     detector = FaceDetector()
     
-    # Try to open camera
-    if config.USE_PI_CAMERA:
-        try:
-            from picamera2 import Picamera2
-            camera = Picamera2()
-            camera_config = camera.create_preview_configuration(
-                main={"size": (config.CAMERA_WIDTH, config.CAMERA_HEIGHT)}
-            )
-            camera.configure(camera_config)
-            camera.start()
-            print("[INFO] Using Pi Camera")
-            
-            import time
-            time.sleep(2)  # Warm up camera
-            
-            # Capture and test
-            frame = camera.capture_array()
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-        except Exception as e:
-            print(f"[ERROR] Pi Camera failed: {e}")
-            print("[INFO] Falling back to USB camera")
-            camera = cv2.VideoCapture(0)
-            ret, frame = camera.read()
-    else:
-        camera = cv2.VideoCapture(0)
+    # Use camera wrapper with preview
+    camera = Camera(config.CAMERA_WIDTH, config.CAMERA_HEIGHT, 
+                   config.USE_PI_CAMERA, preview=True)
+    
+    if not camera.isOpened():
+        print("[ERROR] No camera available!")
+        print("[INFO] Camera test skipped")
+        sys.exit(0)
+    
+    print("[INFO] Showing live preview for 5 seconds...")
+    print("[INFO] Press 'q' to quit early")
+    
+    cv2.namedWindow("Face Detection Test", cv2.WINDOW_NORMAL)
+    
+    start_time = time.time()
+    frame_count = 0
+    
+    while time.time() - start_time < 5:
+        # Capture frame
         ret, frame = camera.read()
-        print("[INFO] Using USB camera")
+        
+        if not ret or frame is None:
+            print("[ERROR] Failed to capture frame")
+            break
+        
+        frame_count += 1
+        
+        # Detect faces
+        faces = detector.detect_faces(frame)
+        
+        # Draw detection boxes
+        display_frame = detector.draw_faces(frame, faces) if len(faces) > 0 else frame.copy()
+        
+        # Add info
+        cv2.putText(display_frame, f"Detected: {len(faces)} face(s)", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, "Press 'q' to quit", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Show frame
+        cv2.imshow("Face Detection Test", display_frame)
+        
+        # Check for quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
     
-    # Detect faces
-    faces = detector.detect_faces(frame)
-    print(f"[INFO] Detected {len(faces)} face(s)")
+    print(f"[INFO] Processed {frame_count} frames")
+    print(f"[INFO] Detected {len(faces)} face(s) in last frame")
     
-    # Draw and show result
+    # Save final frame
+    output_path = os.path.join(config.IMAGES_DIR, 'test_detection.jpg')
     if len(faces) > 0:
         output = detector.draw_faces(frame, faces)
-        cv2.imwrite('/home/bienth/cameraPI/data/test_detection.jpg', output)
-        print("[INFO] Test image saved to data/test_detection.jpg")
+        cv2.imwrite(output_path, output)
+        print(f"[INFO] Test image with detections saved to {output_path}")
+    else:
+        cv2.imwrite(output_path, frame)
+        print(f"[INFO] No faces detected. Frame saved to {output_path}")
     
     # Cleanup
-    if config.USE_PI_CAMERA:
-        try:
-            camera.stop()
-        except:
-            pass
-    else:
-        camera.release()
+    cv2.destroyAllWindows()
+    camera.release()
     
     print("[INFO] Test complete")

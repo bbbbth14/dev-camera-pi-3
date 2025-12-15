@@ -1,9 +1,9 @@
 """
 Face Recognition Module
-Handles face encoding and recognition using face_recognition library
+Handles face encoding and recognition using OpenCV
 """
 
-import face_recognition
+import cv2
 import numpy as np
 import pickle
 import os
@@ -12,13 +12,17 @@ import config
 
 
 class FaceRecognizer:
-    """Face recognizer using face_recognition library"""
+    """Face recognizer using OpenCV LBPH (Local Binary Patterns Histograms)"""
     
     def __init__(self):
         """Initialize the face recognizer"""
         self.known_face_encodings = []
         self.known_face_names = []
         self.encodings_file = os.path.join(config.FACES_DIR, 'encodings.pkl')
+        
+        # Initialize OpenCV face recognizer
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
         # Load existing encodings if available
         self.load_encodings()
@@ -33,6 +37,12 @@ class FaceRecognizer:
                     data = pickle.load(f)
                     self.known_face_encodings = data['encodings']
                     self.known_face_names = data['names']
+                
+                # Retrain the recognizer with loaded data
+                if len(self.known_face_encodings) > 0:
+                    labels = list(range(len(self.known_face_names)))
+                    self.recognizer.train(self.known_face_encodings, np.array(labels))
+                
                 print(f"[INFO] Loaded {len(self.known_face_names)} face encoding(s)")
             except Exception as e:
                 print(f"[ERROR] Failed to load encodings: {e}")
@@ -62,26 +72,27 @@ class FaceRecognizer:
         Returns:
             Face encoding array or None if no face detected
         """
-        # Convert BGR to RGB
-        rgb_image = image[:, :, ::-1]
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Detect face locations
-        face_locations = face_recognition.face_locations(rgb_image, model=config.MODEL)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
         
-        if len(face_locations) == 0:
+        if len(faces) == 0:
             print("[WARNING] No face detected in image")
             return None
         
-        if len(face_locations) > 1:
+        if len(faces) > 1:
             print("[WARNING] Multiple faces detected, using the first one")
         
-        # Generate encoding for the first detected face
-        encodings = face_recognition.face_encodings(rgb_image, face_locations)
+        # Extract the first detected face
+        (x, y, w, h) = faces[0]
+        face_roi = gray[y:y+h, x:x+w]
         
-        if len(encodings) > 0:
-            return encodings[0]
+        # Resize to standard size for consistency
+        face_roi = cv2.resize(face_roi, (200, 200))
         
-        return None
+        return face_roi
     
     def add_face(self, name: str, image: np.ndarray) -> bool:
         """
@@ -108,6 +119,11 @@ class FaceRecognizer:
             self.known_face_encodings.append(encoding)
             self.known_face_names.append(name)
         
+        # Retrain the recognizer
+        if len(self.known_face_encodings) > 0:
+            labels = list(range(len(self.known_face_names)))
+            self.recognizer.train(self.known_face_encodings, np.array(labels))
+        
         self.save_encodings()
         print(f"[INFO] Added/updated face for {name}")
         return True
@@ -125,41 +141,33 @@ class FaceRecognizer:
         if len(self.known_face_encodings) == 0:
             return []
         
-        # Convert BGR to RGB
-        rgb_image = image[:, :, ::-1]
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Detect face locations and encodings
-        face_locations = face_recognition.face_locations(rgb_image, model=config.MODEL)
-        face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+        # Detect face locations
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
         
         results = []
         
-        for face_encoding in face_encodings:
-            # Compare with known faces
-            matches = face_recognition.compare_faces(
-                self.known_face_encodings,
-                face_encoding,
-                tolerance=config.RECOGNITION_TOLERANCE
-            )
+        for (x, y, w, h) in faces:
+            face_roi = gray[y:y+h, x:x+w]
+            face_roi = cv2.resize(face_roi, (200, 200))
             
-            # Calculate face distances
-            face_distances = face_recognition.face_distance(
-                self.known_face_encodings,
-                face_encoding
-            )
+            # Predict the face
+            label, confidence = self.recognizer.predict(face_roi)
             
-            name = "Unknown"
-            confidence = 0.0
+            # LBPH confidence is inverse (lower is better)
+            # Convert to 0-1 scale where 1 is best match
+            # Typical LBPH confidence values range from 0-100+
+            if confidence < 50:  # Good match threshold
+                name = self.known_face_names[label]
+                # Normalize confidence (inverted and scaled)
+                confidence_score = max(0, 1 - (confidence / 100))
+            else:
+                name = "Unknown"
+                confidence_score = 0.0
             
-            if len(face_distances) > 0:
-                best_match_index = np.argmin(face_distances)
-                
-                if matches[best_match_index]:
-                    name = self.known_face_names[best_match_index]
-                    # Convert distance to confidence (0-1, where 1 is perfect match)
-                    confidence = 1 - face_distances[best_match_index]
-            
-            results.append((name, confidence))
+            results.append((name, confidence_score))
         
         return results
     
