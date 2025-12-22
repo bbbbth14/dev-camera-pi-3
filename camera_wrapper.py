@@ -85,6 +85,16 @@ class Camera:
         
         return success, frame
     
+    def read_frame(self):
+        """
+        Convenience method to read a frame (returns frame only)
+        
+        Returns:
+            frame or None if failed
+        """
+        success, frame = self.read()
+        return frame if success else None
+    
     def show_frame(self, frame, window_name="Camera Preview"):
         """
         Display frame in window if preview is enabled

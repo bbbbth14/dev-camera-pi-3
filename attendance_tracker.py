@@ -16,16 +16,31 @@ class AttendanceTracker:
     def __init__(self):
         """Initialize the attendance tracker"""
         self.attendance_file = config.ATTENDANCE_FILE
+        self.status_log_file = os.path.join(config.DATA_DIR, 'status_log.csv')
         self.last_checkin = {}  # Track last check-in time per person
         
         # Create attendance file if it doesn't exist
         if not os.path.exists(self.attendance_file):
             self._create_attendance_file()
         
+        # Create status log file if it doesn't exist
+        if not os.path.exists(self.status_log_file):
+            self._create_status_log_file()
+        
         # Load last check-ins from today
         self._load_today_checkins()
         
         print("[INFO] Attendance tracker initialized")
+    
+    def _create_status_log_file(self):
+        """Create a new status log CSV file with headers"""
+        try:
+            with open(self.status_log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Timestamp', 'Name', 'Status', 'Check_In_Time', 'Check_Out_Time', 'Duration'])
+            print(f"[INFO] Created new status log file: {self.status_log_file}")
+        except Exception as e:
+            print(f"[ERROR] Failed to create status log file: {e}")
     
     def _create_attendance_file(self):
         """Create a new attendance CSV file with headers"""
@@ -220,6 +235,127 @@ class AttendanceTracker:
             
         except Exception as e:
             print(f"[ERROR] Failed to export report: {e}")
+    
+    def get_user_status(self) -> Dict[str, Dict]:
+        """
+        Get status of all users with their last check-in/out
+        
+        Returns:
+            Dictionary with user status information
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        user_status = {}
+        
+        try:
+            if os.path.exists(self.attendance_file):
+                with open(self.attendance_file, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        if row['Date'] == today and row['Event'] in ['CHECK_IN', 'CHECK_OUT']:
+                            name = row['Name']
+                            event = row['Event']
+                            time_str = row['Time']
+                            
+                            if name not in user_status:
+                                user_status[name] = {
+                                    'last_event': event,
+                                    'last_time': time_str,
+                                    'status': 'OUT',
+                                    'check_in_time': None,
+                                    'check_out_time': None,
+                                    'duration': None,
+                                    'first_check_in': None
+                                }
+                            
+                            # Update last event
+                            user_status[name]['last_event'] = event
+                            user_status[name]['last_time'] = time_str
+                            
+                            # Track first check-in and last check-out
+                            if event == 'CHECK_IN':
+                                user_status[name]['status'] = 'IN'
+                                user_status[name]['check_out_time'] = None  # Reset checkout
+                                
+                                # Set first check-in if not set
+                                if user_status[name]['first_check_in'] is None:
+                                    user_status[name]['first_check_in'] = time_str
+                                    user_status[name]['check_in_time'] = time_str
+                                
+                            elif event == 'CHECK_OUT':
+                                user_status[name]['status'] = 'OUT'
+                                user_status[name]['check_out_time'] = time_str
+                                
+                                # Calculate duration from FIRST check-in to LAST check-out
+                                if user_status[name]['first_check_in']:
+                                    check_in = datetime.strptime(
+                                        f"{today} {user_status[name]['first_check_in']}", 
+                                        '%Y-%m-%d %H:%M:%S'
+                                    )
+                                    check_out = datetime.strptime(
+                                        f"{today} {time_str}", 
+                                        '%Y-%m-%d %H:%M:%S'
+                                    )
+                                    duration = check_out - check_in
+                                    hours = int(duration.total_seconds() // 3600)
+                                    minutes = int((duration.total_seconds() % 3600) // 60)
+                                    user_status[name]['duration'] = f"{hours}h {minutes}m"
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to get user status: {e}")
+        
+        return user_status
+    
+    def log_status_to_file(self):
+        """Log current status of all users to file"""
+        try:
+            user_status = self.get_user_status()
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            with open(self.status_log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                for name, status in user_status.items():
+                    writer.writerow([
+                        timestamp,
+                        name,
+                        status['status'],
+                        status.get('check_in_time', 'N/A'),
+                        status.get('check_out_time', 'N/A'),
+                        status.get('duration', 'N/A')
+                    ])
+            
+            print(f"[INFO] Logged status for {len(user_status)} users")
+            return True
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to log status: {e}")
+            return False
+    
+    def check_in_out(self, name: str) -> str:
+        """
+        Toggle check-in/check-out for a person
+        
+        Args:
+            name: Person's name
+            
+        Returns:
+            Status message
+        """
+        # Get current status
+        user_status = self.get_user_status()
+        
+        # Check current status - if IN, then CHECK OUT; otherwise CHECK IN
+        if name in user_status and user_status[name]['status'] == 'IN':
+            # User is IN, so CHECK OUT
+            self.record_event(name, 'CHECK_OUT')
+            # Log status after check-out
+            self.log_status_to_file()
+            return 'CHECKED OUT'
+        else:
+            # User is OUT or not checked in, so CHECK IN
+            self.record_event(name, 'CHECK_IN')
+            # Log status after check-in
+            self.log_status_to_file()
+            return 'CHECKED IN'
 
 
 if __name__ == "__main__":
@@ -246,3 +382,4 @@ if __name__ == "__main__":
     print(f"\n[INFO] Today's Records ({len(records)} total):")
     for record in records[-5:]:  # Show last 5
         print(f"  {record['Name']} - {record['Event']} at {record['Time']}")
+

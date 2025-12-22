@@ -3,3 +3,4 @@ opencv-contrib-python
 numpy
 Pillow
 picamera2
+flask
