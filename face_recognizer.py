@@ -23,12 +23,31 @@ class FaceRecognizer:
         
         # Initialize OpenCV face recognizer
         self.recognizer = cv2.face.LBPHFaceRecognizer_create()
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Find cascade file
+        cascade_path = self._find_cascade_file()
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
         
         # Load existing encodings if available
         self.load_encodings()
         
         print(f"[INFO] Face recognizer initialized with {len(self.known_face_names)} known face(s)")
+    
+    def _find_cascade_file(self):
+        """Find the haarcascade file in various locations"""
+        cascade_paths = [
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml' if hasattr(cv2, 'data') else None,
+            '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            'haarcascade_frontalface_default.xml',
+        ]
+        
+        for path in cascade_paths:
+            if path and os.path.exists(path):
+                return path
+        
+        # If not found, use the one we downloaded
+        return 'haarcascade_frontalface_default.xml'
     
     def load_encodings(self):
         """Load face encodings from file and retrain"""

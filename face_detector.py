@@ -18,7 +18,28 @@ class FaceDetector:
     def __init__(self):
         """Initialize the face detector"""
         # Load the pre-trained Haar Cascade classifier
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        # Try multiple possible locations for the cascade file
+        cascade_paths = [
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml' if hasattr(cv2, 'data') else None,
+            '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
+            os.path.join(os.path.dirname(__file__), 'haarcascade_frontalface_default.xml'),
+        ]
+        
+        cascade_path = None
+        for path in cascade_paths:
+            if path and os.path.exists(path):
+                cascade_path = path
+                break
+        
+        if not cascade_path:
+            # Download if not found
+            import urllib.request
+            cascade_url = 'https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml'
+            cascade_path = 'haarcascade_frontalface_default.xml'
+            print(f"[INFO] Downloading face cascade to {cascade_path}...")
+            urllib.request.urlretrieve(cascade_url, cascade_path)
+        
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
         
         if self.face_cascade.empty():

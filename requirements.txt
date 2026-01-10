@@ -5,3 +5,6 @@ Pillow
 picamera2
 flask
 openpyxl
+st7789
+face_recognition
+dlib
