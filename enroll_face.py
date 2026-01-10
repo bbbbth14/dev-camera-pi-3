@@ -8,8 +8,10 @@ import argparse
 import sys
 import os
 import time
+from datetime import datetime
 from face_recognizer import FaceRecognizer
 from camera_wrapper import Camera
+from attendance_tracker import AttendanceTracker
 import config
 
 
@@ -114,8 +116,18 @@ def capture_face_samples(name: str, num_samples: int = 5):
     if best_sample is not None and samples_captured > 0:
         print(f"\n[INFO] Adding {name} to face database...")
         if recognizer.add_face(name, best_sample):
+            # Generate and save User ID
+            tracker = AttendanceTracker()
+            user_id = tracker._get_or_create_user_id(name)
+            
             print(f"[SUCCESS] {name} enrolled successfully!")
+            print(f"[SUCCESS] User ID assigned: {user_id}")
             print(f"[INFO] Total known faces: {len(recognizer.list_known_faces())}")
+            
+            # Update User Directory in Excel
+            tracker.update_user_directory()
+            print(f"[INFO] User directory updated in Excel")
+            
             return True
         else:
             print("[ERROR] Failed to add face to database")
@@ -141,8 +153,13 @@ def main():
         print("\n[INFO] Enrolled faces:")
         faces = recognizer.list_known_faces()
         if faces:
+            # Also show User IDs
+            tracker = AttendanceTracker()
+            print(f"\n{'#':<4} {'Name':<20} {'User ID':<15}")
+            print("-" * 40)
             for i, name in enumerate(faces, 1):
-                print(f"  {i}. {name}")
+                user_id = tracker._get_or_create_user_id(name)
+                print(f"{i:<4} {name:<20} {user_id:<15}")
         else:
             print("  No faces enrolled yet")
         return

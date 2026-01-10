@@ -6,6 +6,9 @@ Manages attendance records and access control
 import csv
 import os
 import threading
+import calendar
+import uuid
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from zipfile import BadZipFile
@@ -26,8 +29,13 @@ class AttendanceTracker:
         """Initialize the attendance tracker"""
         self.attendance_file = config.ATTENDANCE_FILE
         self.status_log_file = os.path.join(config.DATA_DIR, 'status_log.csv')
+        self.user_ids_file = os.path.join(config.DATA_DIR, 'user_ids.csv')
         self.last_checkin = {}  # Track last check-in time per person
+        self.user_ids = {}  # Map user names to IDs
         self._excel_lock = threading.Lock()
+        
+        # Load user IDs
+        self._load_user_ids()
         
         # Create (or recover) attendance file
         if not os.path.exists(self.attendance_file):
@@ -59,53 +67,303 @@ class AttendanceTracker:
         
         print("[INFO] Attendance tracker initialized")
     
+    def _load_user_ids(self):
+        """Load user IDs from file or create new file"""
+        try:
+            if os.path.exists(self.user_ids_file):
+                with open(self.user_ids_file, 'r') as f:
+                    reader = csv.reader(f)
+                    next(reader)  # Skip header
+                    for row in reader:
+                        if len(row) >= 2:
+                            self.user_ids[row[0]] = row[1]
+            else:
+                # Create new user IDs file
+                with open(self.user_ids_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['Name', 'UserID'])
+                print(f"[INFO] Created new user IDs file: {self.user_ids_file}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load user IDs: {e}")
+    
+    def _generate_user_id(self, name: str) -> str:
+        """Generate a unique ID for a user based on their name"""
+        # Use first 8 characters of MD5 hash for consistency
+        hash_obj = hashlib.md5(name.encode())
+        user_id = hash_obj.hexdigest()[:8].upper()
+        return f"USR{user_id}"
+    
+    def _get_or_create_user_id(self, name: str) -> str:
+        """Get existing user ID or create a new one"""
+        if name not in self.user_ids:
+            user_id = self._generate_user_id(name)
+            self.user_ids[name] = user_id
+            
+            # Save to file
+            try:
+                with open(self.user_ids_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([name, user_id])
+            except Exception as e:
+                print(f"[ERROR] Failed to save user ID: {e}")
+        
+        return self.user_ids[name]
+    
     def _create_status_log_file(self):
         """Create a new status log CSV file with headers"""
         try:
             with open(self.status_log_file, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Timestamp', 'Name', 'Status', 'Check_In_Time', 'Check_Out_Time', 'Duration'])
+                writer.writerow(['Timestamp', 'Name', 'UserID', 'Status', 'Check_In_Time', 'Check_Out_Time', 'Duration'])
             print(f"[INFO] Created new status log file: {self.status_log_file}")
         except Exception as e:
             print(f"[ERROR] Failed to create status log file: {e}")
     
+    def update_user_directory(self):
+        """Create or update the User Directory sheet in Excel with all enrolled users"""
+        try:
+            if not EXCEL_AVAILABLE or not os.path.exists(self.attendance_file):
+                return
+            
+            with self._excel_lock:
+                wb = load_workbook(self.attendance_file)
+                
+                # Create or get User Directory sheet
+                if 'User Directory' in wb.sheetnames:
+                    ws = wb['User Directory']
+                    # Clear existing data (keep header)
+                    ws.delete_rows(2, ws.max_row)
+                else:
+                    ws = wb.create_sheet('User Directory', 0)  # Insert at beginning
+                    
+                    # Create header
+                    ws.merge_cells('A1:E1')
+                    ws['A1'] = 'USER DIRECTORY'
+                    ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
+                    ws['A1'].fill = PatternFill(start_color="2E86AB", end_color="2E86AB", fill_type="solid")
+                    ws['A1'].alignment = Alignment(horizontal="center", vertical="center")
+                    
+                    # Column headers
+                    headers = ['#', 'Name', 'User ID', 'Enrolled Date', 'Total Attendance Days']
+                    ws.append(headers)
+                    
+                    for cell in ws[2]:
+                        cell.font = Font(bold=True, size=11)
+                        cell.fill = PatternFill(start_color="A8DADC", end_color="A8DADC", fill_type="solid")
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    
+                    # Set column widths
+                    ws.column_dimensions['A'].width = 6
+                    ws.column_dimensions['B'].width = 20
+                    ws.column_dimensions['C'].width = 15
+                    ws.column_dimensions['D'].width = 15
+                    ws.column_dimensions['E'].width = 22
+                
+                # Get all users from user_ids
+                users = sorted(self.user_ids.items(), key=lambda x: x[0])
+                
+                # Add user data
+                for idx, (name, user_id) in enumerate(users, 1):
+                    # Try to find enrollment date from first attendance
+                    enrolled_date = "N/A"
+                    total_days = 0
+                    
+                    # Count total attendance days across all sheets
+                    for sheet_name in wb.sheetnames:
+                        if sheet_name.startswith(f"{name}_"):
+                            # This is a user sheet
+                            user_sheet = wb[sheet_name]
+                            
+                            # Count days with attendance (has First In value)
+                            for row in user_sheet.iter_rows(min_row=3, values_only=True):
+                                if len(row) > 2 and row[2]:  # Has First In time
+                                    total_days += 1
+                                    # Get earliest date as enrollment date
+                                    if enrolled_date == "N/A" and row[0]:
+                                        enrolled_date = row[0] if isinstance(row[0], str) else row[0].strftime('%Y-%m-%d')
+                    
+                    # If no attendance, use today as enrolled date
+                    if enrolled_date == "N/A":
+                        enrolled_date = datetime.now().strftime('%Y-%m-%d')
+                    
+                    row_data = [idx, name, user_id, enrolled_date, total_days]
+                    ws.append(row_data)
+                    
+                    # Format the row
+                    row_num = ws.max_row
+                    ws.cell(row_num, 1).alignment = Alignment(horizontal="center")
+                    ws.cell(row_num, 3).alignment = Alignment(horizontal="center")
+                    ws.cell(row_num, 4).alignment = Alignment(horizontal="center")
+                    ws.cell(row_num, 5).alignment = Alignment(horizontal="center")
+                    
+                    # Alternate row colors
+                    if idx % 2 == 0:
+                        for col in range(1, 6):
+                            ws.cell(row_num, col).fill = PatternFill(start_color="F1FAEE", end_color="F1FAEE", fill_type="solid")
+                
+                # Add summary at bottom
+                summary_row = ws.max_row + 2
+                ws.merge_cells(f'A{summary_row}:B{summary_row}')
+                ws[f'A{summary_row}'] = 'Total Users:'
+                ws[f'A{summary_row}'].font = Font(bold=True)
+                ws[f'A{summary_row}'].alignment = Alignment(horizontal="right")
+                ws[f'C{summary_row}'] = len(users)
+                ws[f'C{summary_row}'].font = Font(bold=True)
+                ws[f'C{summary_row}'].fill = PatternFill(start_color="E63946", end_color="E63946", fill_type="solid")
+                ws[f'C{summary_row}'].font = Font(bold=True, color="FFFFFF")
+                ws[f'C{summary_row}'].alignment = Alignment(horizontal="center")
+                
+                wb.save(self.attendance_file)
+                wb.close()
+                
+                print(f"[INFO] User Directory updated with {len(users)} users")
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to update user directory: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _create_attendance_file(self):
-        """Create a new attendance Excel file with headers"""
+        """Create a new attendance Excel file with monthly format - one sheet per user"""
         try:
             if not EXCEL_AVAILABLE:
                 print("[ERROR] openpyxl not installed")
                 return
             
             wb = Workbook()
-            ws = wb.active
-            ws.title = "Attendance"
+            # Remove default sheet
+            wb.remove(wb.active)
             
-            # Headers with styling
-            headers = ['Name', 'Day', 'Time In', 'Time Out', 'Total', 'Status', 'Time Late', 'Time OT']
+            # Create a template sheet (will be used when new users are added)
+            ws = wb.create_sheet("Template")
+            
+            # Get current month/year for headers
+            now = datetime.now()
+            month_year = now.strftime('%B %Y')
+            
+            # Headers - Date column + Time In/Out columns for each day
+            headers = ['Date', 'Day', 'First In', 'Last Out', 'Total Hours', 'Status', 'Late', 'OT']
             ws.append(headers)
             
             # Style headers
-            header_font = Font(bold=True, size=12)
-            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
             for cell in ws[1]:
                 cell.font = Font(bold=True, size=12, color="FFFFFF")
-                cell.fill = header_fill
+                cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             
             # Set column widths
-            ws.column_dimensions['A'].width = 15  # Name
-            ws.column_dimensions['B'].width = 12  # Day
-            ws.column_dimensions['C'].width = 12  # Time In
-            ws.column_dimensions['D'].width = 12  # Time Out
-            ws.column_dimensions['E'].width = 12  # Total
-            ws.column_dimensions['F'].width = 15  # Status
-            ws.column_dimensions['G'].width = 12  # Time Late
-            ws.column_dimensions['H'].width = 12  # Time OT
+            ws.column_dimensions['A'].width = 12  # Date
+            ws.column_dimensions['B'].width = 10  # Day
+            ws.column_dimensions['C'].width = 10  # First In
+            ws.column_dimensions['D'].width = 10  # Last Out
+            ws.column_dimensions['E'].width = 12  # Total Hours
+            ws.column_dimensions['F'].width = 12  # Status
+            ws.column_dimensions['G'].width = 8   # Late
+            ws.column_dimensions['H'].width = 8   # OT
+            
+            # Hide template sheet
+            ws.sheet_state = 'hidden'
             
             wb.save(self.attendance_file)
             print(f"[INFO] Created new attendance file: {self.attendance_file}")
         except Exception as e:
             print(f"[ERROR] Failed to create attendance file: {e}")
+    
+    def _get_or_create_user_sheet(self, wb, name: str, current_date: datetime):
+        """Get or create a sheet for a specific user with monthly calendar"""
+        month_year = current_date.strftime('%B_%Y')
+        sheet_name = f"{name}_{month_year}"
+        
+        # Check if sheet exists
+        if sheet_name in wb.sheetnames:
+            return wb[sheet_name]
+        
+        # Get or create user ID
+        user_id = self._get_or_create_user_id(name)
+        
+        # Create new sheet for this user
+        ws = wb.create_sheet(sheet_name)
+        
+        # Add header with user name, ID and month
+        ws.merge_cells('A1:H1')
+        ws['A1'] = f"{name} (ID: {user_id}) - {current_date.strftime('%B %Y')}"
+        ws['A1'].font = Font(bold=True, size=14)
+        ws['A1'].alignment = Alignment(horizontal="center")
+        ws['A1'].fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
+        
+        # Column headers
+        headers = ['Date', 'Day', 'First In', 'Last Out', 'Total Hours', 'Status', 'Late', 'OT']
+        ws.append(headers)
+        
+        for cell in ws[2]:
+            cell.font = Font(bold=True, size=11)
+            cell.fill = PatternFill(start_color="B4C7E7", end_color="B4C7E7", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+        # Set column widths
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 10
+        ws.column_dimensions['C'].width = 10
+        ws.column_dimensions['D'].width = 10
+        ws.column_dimensions['E'].width = 12
+        ws.column_dimensions['F'].width = 12
+        ws.column_dimensions['G'].width = 8
+        ws.column_dimensions['H'].width = 8
+        
+        # Pre-fill all days of the month
+        import calendar
+        year = current_date.year
+        month = current_date.month
+        days_in_month = calendar.monthrange(year, month)[1]
+        
+        for day in range(1, days_in_month + 1):
+            date_obj = datetime(year, month, day)
+            date_str = date_obj.strftime('%Y-%m-%d')
+            day_name = date_obj.strftime('%a')
+            
+            row = [date_str, day_name, '', '', '', '', '', '']
+            ws.append(row)
+            
+            # Color weekends differently
+            row_num = ws.max_row
+            if day_name in ['Sat', 'Sun']:
+                for col in range(1, 9):
+                    ws.cell(row_num, col).fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        
+        # Add monthly summary section
+        summary_row = ws.max_row + 2
+        ws.merge_cells(f'A{summary_row}:H{summary_row}')
+        ws[f'A{summary_row}'] = 'MONTHLY SUMMARY'
+        ws[f'A{summary_row}'].font = Font(bold=True, size=12, color="FFFFFF")
+        ws[f'A{summary_row}'].fill = PatternFill(start_color="E67E22", end_color="E67E22", fill_type="solid")
+        ws[f'A{summary_row}'].alignment = Alignment(horizontal="center")
+        
+        summary_row += 1
+        summary_labels = [
+            ('A', 'Total Working Days:', 'B'),
+            ('D', 'Total Hours Worked:', 'E'),
+            ('A', 'Days Late:', 'B'),
+            ('D', 'Total Late Time:', 'E'),
+            ('A', 'Days with OT:', 'B'),
+            ('D', 'Total OT:', 'E')
+        ]
+        
+        for i in range(0, len(summary_labels), 2):
+            label1_col, label1_text, value1_col = summary_labels[i]
+            label2_col, label2_text, value2_col = summary_labels[i+1]
+            
+            ws[f'{label1_col}{summary_row}'] = label1_text
+            ws[f'{label1_col}{summary_row}'].font = Font(bold=True)
+            ws[f'{value1_col}{summary_row}'] = '=COUNTA(C3:C' + str(3 + days_in_month - 1) + ')' if 'Working Days' in label1_text else '0'
+            
+            ws[f'{label2_col}{summary_row}'] = label2_text
+            ws[f'{label2_col}{summary_row}'].font = Font(bold=True)
+            ws[f'{value2_col}{summary_row}'] = '0h 0m'
+            
+            summary_row += 1
+        
+        return ws
     
     def _load_today_checkins(self):
         """Load check-in times from today to enforce cooldown"""
@@ -180,7 +438,7 @@ class AttendanceTracker:
     
     def record_event(self, name: str, event: str, confidence: float = 1.0) -> bool:
         """
-        Record an attendance event to Excel
+        Record an attendance event to Excel - Monthly format with one sheet per user
         
         Args:
             name: Person's name
@@ -199,51 +457,37 @@ class AttendanceTracker:
             date_str = now.strftime('%Y-%m-%d')
             time_str = now.strftime('%H:%M:%S')
             
-            # Get user status to determine punctuality (computed outside the Excel lock)
-            user_status = self.get_user_status()
-
             with self._excel_lock:
                 wb = load_workbook(self.attendance_file)
-                ws = wb.active
-
-                # Find if user already has a row for today
-                # IMPORTANT: Find the LAST (most recent) row for today, not the first
+                
+                # Get or create user's monthly sheet
+                ws = self._get_or_create_user_sheet(wb, name, now)
+                
+                # Find row for today (skip header rows 1 and 2)
                 user_row = None
-                for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=False), start=2):
-                    if row[0].value == name and row[1].value == date_str:
-                        user_row = idx  # Keep updating - will end up with the last match
-
+                for idx, row in enumerate(ws.iter_rows(min_row=3, values_only=False), start=3):
+                    if row[0].value == date_str:
+                        user_row = idx
+                        break
+                
+                if not user_row:
+                    print(f"[ERROR] Date {date_str} not found in {name}'s sheet")
+                    wb.close()
+                    return False
+                
                 if event == 'CHECK_IN':
-                    # ONE row per person per day
-                    # CHECK IN = FIRST check-in time of the day (NEVER update)
-                    if user_row is not None:
-                        existing_time_in = ws.cell(user_row, 3).value
-                        existing_time_out = ws.cell(user_row, 4).value
+                    # Update First In (only if empty - preserve first check-in)
+                    if not ws.cell(user_row, 3).value:
+                        ws.cell(user_row, 3, time_str)
                         
-                        # If already has first check-in time
-                        if existing_time_in:
-                            # If also has checkout (user is OUT), clear checkout so status becomes IN
-                            if existing_time_out:
-                                print(f"[DEBUG] Clearing checkout time to toggle status to IN")
-                                ws.cell(user_row, 4).value = None  # Clear Time Out
-                                ws.cell(user_row, 5).value = None  # Clear Total
-                                wb.save(self.attendance_file)
-                                wb.close()
-                                return True
-                            else:
-                                # Already IN, don't update
-                                print(f"[DEBUG] Already IN, not updating Excel")
-                                wb.close()
-                                return True
-
-                    # Determine punctuality for first check-in
-                    punctuality = ''
-                    time_late = ''
-                    if name not in user_status or user_status[name].get('first_check_in') is None:
-                        cutoff_time = datetime.strptime("08:00:00", "%H:%M:%S").time()
+                        # Determine punctuality
+                        cutoff_time = datetime.strptime("08:30:00", "%H:%M:%S").time()
                         if now.time() > cutoff_time:
-                            punctuality = 'LATE'
-                            cutoff_dt = datetime.strptime("08:00:00", "%H:%M:%S")
+                            ws.cell(user_row, 6, 'LATE')
+                            ws.cell(user_row, 6).font = Font(bold=True, color="FF0000")
+                            
+                            # Calculate late time
+                            cutoff_dt = datetime.strptime("08:30:00", "%H:%M:%S")
                             late_duration = now - cutoff_dt.replace(year=now.year, month=now.month, day=now.day)
                             late_minutes = int(late_duration.total_seconds() // 60)
                             late_hours = late_minutes // 60
@@ -252,66 +496,45 @@ class AttendanceTracker:
                                 time_late = f"{late_hours}h {late_mins}m"
                             else:
                                 time_late = f"{late_mins}m"
+                            ws.cell(user_row, 7, time_late)
+                            ws.cell(user_row, 7).font = Font(bold=True, color="FF0000")
                         else:
-                            punctuality = 'ON TIME'
-                            time_late = '0m'
-
-                    if user_row is None:
-                        # New entry - first check-in of the day
-                        ws.append([name, date_str, time_str, '', '', punctuality, time_late, ''])
-                        new_row = ws.max_row
-                        if punctuality == 'LATE':
-                            ws.cell(new_row, 6).font = Font(bold=True, color="FF0000")
-                            ws.cell(new_row, 7).font = Font(bold=True, color="FF0000")
-                        else:
-                            ws.cell(new_row, 6).font = Font(bold=True, color="00B050")
-                            ws.cell(new_row, 7).font = Font(bold=True, color="00B050")
+                            ws.cell(user_row, 6, 'ON TIME')
+                            ws.cell(user_row, 6).font = Font(bold=True, color="00B050")
+                            ws.cell(user_row, 7, '0m')
                     else:
-                        # Row exists but had no Time In yet (rare). Fill it once.
-                        ws.cell(user_row, 3).value = time_str
-                        if punctuality:
-                            ws.cell(user_row, 6).value = punctuality
-                            ws.cell(user_row, 7).value = time_late
-                            if punctuality == 'LATE':
-                                ws.cell(user_row, 6).font = Font(bold=True, color="FF0000")
-                                ws.cell(user_row, 7).font = Font(bold=True, color="FF0000")
-                            else:
-                                ws.cell(user_row, 6).font = Font(bold=True, color="00B050")
-                                ws.cell(user_row, 7).font = Font(bold=True, color="00B050")
-
+                        # Already has check-in, toggle by clearing checkout if exists
+                        if ws.cell(user_row, 4).value:
+                            ws.cell(user_row, 4).value = None  # Clear Last Out
+                            ws.cell(user_row, 5).value = None  # Clear Total
+                            ws.cell(user_row, 8).value = None  # Clear OT
+                
                 elif event == 'CHECK_OUT':
-                    if not user_row:
-                        print(f"[DEBUG] Refusing CHECK OUT - no row found for today")
-                        wb.close()
-                        return False
-
-                    # If no check-in time, can't check out.
+                    # Check if has check-in
                     if not ws.cell(user_row, 3).value:
-                        print(f"[DEBUG] Refusing CHECK OUT - no check-in time")
+                        print(f"[DEBUG] Refusing CHECK OUT - no check-in time for {date_str}")
                         wb.close()
                         return False
-
-                    # Always UPDATE checkout time to the LAST checkout
-                    ws.cell(user_row, 4).value = time_str  # Time Out (last checkout)
-                    print(f"[DEBUG] Updated CHECK OUT time to {time_str}")
                     
-                    # Calculate and update total time (from FIRST check-in to LAST check-out)
+                    # Always update Last Out (keep last checkout)
+                    ws.cell(user_row, 4, time_str)
+                    
+                    # Calculate total time
                     time_in = ws.cell(user_row, 3).value
                     if time_in:
                         try:
                             in_dt = datetime.strptime(time_in, "%H:%M:%S")
                             out_dt = datetime.strptime(time_str, "%H:%M:%S")
                             duration = out_dt - in_dt
-                            print(f"[DEBUG] Total time calculated: {time_in} to {time_str} = {duration}")
                             hours = duration.seconds // 3600
                             minutes = (duration.seconds % 3600) // 60
                             total_str = f"{hours}h {minutes}m"
-                            ws.cell(user_row, 5).value = total_str  # Total
+                            ws.cell(user_row, 5, total_str)  # Total Hours
                             
-                            # Calculate overtime (after 7PM = 19:00)
-                            ot_cutoff = datetime.strptime("19:00:00", "%H:%M:%S").time()
+                            # Calculate overtime (after 5PM = 17:00)
+                            ot_cutoff = datetime.strptime("17:00:00", "%H:%M:%S").time()
                             if now.time() > ot_cutoff:
-                                ot_start = datetime.strptime("19:00:00", "%H:%M:%S")
+                                ot_start = datetime.strptime("17:00:00", "%H:%M:%S")
                                 ot_start = ot_start.replace(year=now.year, month=now.month, day=now.day)
                                 ot_duration = now - ot_start
                                 ot_minutes = int(ot_duration.total_seconds() // 60)
@@ -321,15 +544,18 @@ class AttendanceTracker:
                                     ot_str = f"{ot_hours}h {ot_mins}m"
                                 else:
                                     ot_str = f"{ot_mins}m"
-                                ws.cell(user_row, 8).value = ot_str  # Time OT
-                                ws.cell(user_row, 8).font = Font(bold=True, color="FFA500")  # Orange
+                                ws.cell(user_row, 8, ot_str)
+                                ws.cell(user_row, 8).font = Font(bold=True, color="FFA500")
                             else:
-                                ws.cell(user_row, 8).value = '0m'
-                        except:
-                            pass
-            
+                                ws.cell(user_row, 8, '0m')
+                        except Exception as calc_err:
+                            print(f"[WARN] Failed to calculate time: {calc_err}")
+                
                 wb.save(self.attendance_file)
                 wb.close()
+            
+            # Update monthly summary
+            self.update_monthly_summary(name, now)
             
             # Update last check-in time
             if event in ['CHECK_IN', 'ACCESS_GRANTED']:
@@ -340,11 +566,13 @@ class AttendanceTracker:
             
         except Exception as e:
             print(f"[ERROR] Failed to record event: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get_today_attendance(self) -> List[Dict[str, str]]:
         """
-        Get all attendance records for today
+        Get all attendance records for today (multi-sheet format)
         
         Returns:
             List of attendance records
@@ -353,12 +581,45 @@ class AttendanceTracker:
         records = []
         
         try:
-            if os.path.exists(self.attendance_file):
-                with open(self.attendance_file, 'r') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        if row['Date'] == today:
-                            records.append(row)
+            if not EXCEL_AVAILABLE or not os.path.exists(self.attendance_file):
+                return records
+            
+            with self._excel_lock:
+                wb = load_workbook(self.attendance_file)
+                
+                # Iterate through all sheets (except Template)
+                for sheet_name in wb.sheetnames:
+                    if sheet_name == 'Template':
+                        continue
+                    
+                    ws = wb[sheet_name]
+                    
+                    # Extract user name from sheet name
+                    name = sheet_name.split('_')[0] if '_' in sheet_name else sheet_name
+                    
+                    # Find today's row (skip header rows 1 and 2)
+                    for row in ws.iter_rows(min_row=3, values_only=True):
+                        if len(row) < 6:
+                            continue
+                        
+                        date_str = row[0]
+                        
+                        if date_str == today:
+                            records.append({
+                                'Name': name,
+                                'Date': date_str,
+                                'Day': row[1],
+                                'Time In': row[2] if row[2] else '',
+                                'Time Out': row[3] if row[3] else '',
+                                'Total': row[4] if row[4] else '',
+                                'Status': row[5] if row[5] else '',
+                                'Time Late': row[6] if len(row) > 6 and row[6] else '0m',
+                                'Time OT': row[7] if len(row) > 7 and row[7] else '0m'
+                            })
+                            break
+                
+                wb.close()
+        
         except Exception as e:
             print(f"[ERROR] Failed to read attendance: {e}")
         
@@ -439,7 +700,7 @@ class AttendanceTracker:
     
     def get_user_status(self) -> Dict[str, Dict]:
         """
-        Get status of all users with their last check-in/out from Excel
+        Get status of all users with their last check-in/out from Excel (multi-sheet format)
         
         Returns:
             Dictionary with user status information
@@ -453,33 +714,40 @@ class AttendanceTracker:
             
             with self._excel_lock:
                 wb = load_workbook(self.attendance_file)
-                ws = wb.active
-            
-                # Read all rows for today
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    # Handle rows with different number of columns
-                    if len(row) < 6:
+                
+                # Iterate through all sheets (except Template)
+                for sheet_name in wb.sheetnames:
+                    if sheet_name == 'Template':
                         continue
-                        
-                    name = row[0]
-                    day = row[1]
-                    time_in = row[2]
-                    time_out = row[3] if len(row) > 3 else None
-                    total = row[4] if len(row) > 4 else None
-                    status_text = row[5] if len(row) > 5 else None
-                    time_late = row[6] if len(row) > 6 else '0m'
-                    time_ot = row[7] if len(row) > 7 else '0m'
                     
-                    if day == today and name:
-                        # Check if currently in OT (after 7PM and still checked in)
-                        is_ot = False
-                        if time_in and not time_out:
-                            current_time = datetime.now().time()
-                            ot_cutoff = datetime.strptime("19:00:00", "%H:%M:%S").time()
-                            if current_time > ot_cutoff:
-                                is_ot = True
+                    ws = wb[sheet_name]
+                    
+                    # Extract user name from sheet name (format: "Name_Month_Year")
+                    name = sheet_name.split('_')[0] if '_' in sheet_name else sheet_name
+                    
+                    # Find today's row (skip header rows 1 and 2)
+                    for row in ws.iter_rows(min_row=3, values_only=True):
+                        if len(row) < 6:
+                            continue
                         
-                        if name not in user_status:
+                        date_str = row[0]  # Date
+                        day_name = row[1]  # Day
+                        time_in = row[2]   # First In
+                        time_out = row[3]  # Last Out
+                        total = row[4]     # Total Hours
+                        status_text = row[5]  # Status
+                        time_late = row[6] if len(row) > 6 else '0m'
+                        time_ot = row[7] if len(row) > 7 else '0m'
+                        
+                        if date_str == today and name:
+                            # Check if currently in OT (after 5PM and still checked in)
+                            is_ot = False
+                            if time_in and not time_out:
+                                current_time = datetime.now().time()
+                                ot_cutoff = datetime.strptime("17:00:00", "%H:%M:%S").time()
+                                if current_time > ot_cutoff:
+                                    is_ot = True
+                            
                             user_status[name] = {
                                 'last_event': 'CHECK_OUT' if time_out else 'CHECK_IN',
                                 'last_time': time_out if time_out else time_in,
@@ -491,16 +759,7 @@ class AttendanceTracker:
                                 'is_overtime': is_ot,
                                 'time_ot': time_ot if time_ot else '0m'
                             }
-                        else:
-                            # Update with latest data
-                            user_status[name]['check_in_time'] = time_in
-                            user_status[name]['check_out_time'] = time_out
-                            user_status[name]['duration'] = total
-                            user_status[name]['status'] = 'OUT' if time_out else 'IN'
-                            user_status[name]['last_time'] = time_out if time_out else time_in
-                            user_status[name]['last_event'] = 'CHECK_OUT' if time_out else 'CHECK_IN'
-                            user_status[name]['is_overtime'] = is_ot
-                            user_status[name]['time_ot'] = time_ot if time_ot else '0m'
+                            break  # Found today's row for this user
 
                 wb.close()
         
@@ -520,9 +779,11 @@ class AttendanceTracker:
             with open(self.status_log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 for name, status in user_status.items():
+                    user_id = self._get_or_create_user_id(name)
                     writer.writerow([
                         timestamp,
                         name,
+                        user_id,
                         status['status'],
                         status.get('check_in_time', 'N/A'),
                         status.get('check_out_time', 'N/A'),
@@ -680,6 +941,84 @@ class AttendanceTracker:
             return f"{hours}h {mins}m"
         else:
             return f"{mins}m"
+    
+    def update_monthly_summary(self, name: str, current_date: datetime = None):
+        """Update monthly summary for a user's sheet"""
+        if current_date is None:
+            current_date = datetime.now()
+        
+        try:
+            if not EXCEL_AVAILABLE or not os.path.exists(self.attendance_file):
+                return
+            
+            with self._excel_lock:
+                wb = load_workbook(self.attendance_file)
+                month_year = current_date.strftime('%B_%Y')
+                sheet_name = f"{name}_{month_year}"
+                
+                if sheet_name not in wb.sheetnames:
+                    wb.close()
+                    return
+                
+                ws = wb[sheet_name]
+                
+                # Find summary section (starts after all days)
+                year = current_date.year
+                month = current_date.month
+                days_in_month = calendar.monthrange(year, month)[1]
+                data_end_row = 2 + days_in_month
+                summary_start = data_end_row + 2
+                
+                # Calculate statistics
+                total_days_worked = 0
+                total_hours_minutes = 0
+                days_late = 0
+                total_late_minutes = 0
+                days_with_ot = 0
+                total_ot_minutes = 0
+                
+                for row_num in range(3, data_end_row + 1):
+                    first_in = ws.cell(row_num, 3).value
+                    total_hours = ws.cell(row_num, 5).value
+                    time_late = ws.cell(row_num, 7).value
+                    time_ot = ws.cell(row_num, 8).value
+                    
+                    # Count working days
+                    if first_in:
+                        total_days_worked += 1
+                    
+                    # Sum total hours
+                    if total_hours:
+                        total_hours_minutes += self._parse_time_to_minutes(total_hours)
+                    
+                    # Count late days
+                    if time_late and time_late != '0m':
+                        days_late += 1
+                        total_late_minutes += self._parse_time_to_minutes(time_late)
+                    
+                    # Count OT days
+                    if time_ot and time_ot != '0m':
+                        days_with_ot += 1
+                        total_ot_minutes += self._parse_time_to_minutes(time_ot)
+                
+                # Update summary cells
+                summary_data_row = summary_start + 1
+                ws.cell(summary_data_row, 2, total_days_worked)  # Total Working Days
+                ws.cell(summary_data_row, 5, self._format_time_from_minutes(total_hours_minutes))  # Total Hours
+                
+                summary_data_row += 1
+                ws.cell(summary_data_row, 2, days_late)  # Days Late
+                ws.cell(summary_data_row, 5, self._format_time_from_minutes(total_late_minutes))  # Total Late Time
+                
+                summary_data_row += 1
+                ws.cell(summary_data_row, 2, days_with_ot)  # Days with OT
+                ws.cell(summary_data_row, 5, self._format_time_from_minutes(total_ot_minutes))  # Total OT
+                
+                wb.save(self.attendance_file)
+                wb.close()
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to update monthly summary: {e}")
     
     def check_in_out(self, name: str) -> str:
         """
