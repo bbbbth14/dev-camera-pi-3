@@ -5,6 +5,36 @@
 
 cd "$(dirname "$0")"
 
+DISPLAY_PID=""
+
+start_lcd_display() {
+    if [ -x "./run_display.sh" ]; then
+        # Avoid starting multiple display processes.
+        if pgrep -f "python3 .*display_attendance\.py" >/dev/null 2>&1; then
+            echo "🖥️  LCD display already running"
+            return 0
+        fi
+
+        echo "🖥️  Starting LCD display (ST7789)..."
+        ./run_display.sh >/tmp/attendance_display.log 2>&1 &
+        DISPLAY_PID=$!
+        sleep 1
+        return 0
+    fi
+
+    echo "⚠️  run_display.sh not executable; skipping LCD display"
+    echo "   Fix with: chmod +x run_display.sh"
+}
+
+stop_lcd_display() {
+    if [ -n "$DISPLAY_PID" ] && kill -0 "$DISPLAY_PID" >/dev/null 2>&1; then
+        echo "🛑 Stopping LCD display..."
+        kill "$DISPLAY_PID" >/dev/null 2>&1 || true
+    fi
+}
+
+trap stop_lcd_display EXIT INT TERM
+
 clear
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║     ENHANCED ATTENDANCE SYSTEM - SMART LAUNCHER              ║"
@@ -44,6 +74,12 @@ if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
     echo "  • Monthly statistics with User IDs"
     echo ""
     sleep 2
+
+    # Web mode: also show status on the ST7789 LCD.
+    start_lcd_display
+
+    # Avoid SPI contention: web_app.py has an optional internal LCD driver.
+    export DISABLE_WEB_LCD=1
     
     ./run_web.sh
     
@@ -64,7 +100,10 @@ else
     echo "⌨️  Press 'q' to quit"
     echo ""
     sleep 2
-    
+
+    # Attendance mode: also show status on the ST7789 LCD.
+    start_lcd_display
+
     python3 offline_attendance.py --no-display
 fi
 

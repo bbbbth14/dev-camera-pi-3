@@ -179,59 +179,72 @@ def scan_for_working_config(base_args: argparse.Namespace) -> None:
     candidates_no_rst = [False, True]
     candidates_no_backlight = [base_args.no_backlight, True] if not base_args.no_backlight else [True]
 
+    # Backlight-only but no pixels is very often caused by wrong DC/RST wiring.
+    # Try a few common GPIO pin sets across ST7789/ST7789V3 modules.
+    candidates_pin_sets = [
+        (base_args.dc, base_args.rst, base_args.backlight),
+        (25, 24, 18),  # common tutorials/hats
+        (9, 25, 13),   # common small ST7789V3 modules
+        (27, 22, 18),  # occasional alternative wiring
+    ]
+
     print("\nSCAN MODE")
     print("- Watch the screen; when you see ANYTHING, note the printed config.")
     print("- If you never see anything, the issue is likely wiring/power/CS/DC/RST.")
 
     trial = 0
     for width, height in candidates_size:
-        for rotation in candidates_rotation:
-            for offset_top in candidates_offset_top:
-                for offset_left in candidates_offset_left:
-                    for invert in candidates_invert:
-                        for speed in candidates_speed:
-                            for cs in candidates_cs:
-                                for no_rst in candidates_no_rst:
-                                    for no_backlight in candidates_no_backlight:
-                                        trial += 1
+        for dc, rst, backlight in candidates_pin_sets:
+            for rotation in candidates_rotation:
+                for offset_top in candidates_offset_top:
+                    for offset_left in candidates_offset_left:
+                        for invert in candidates_invert:
+                            for speed in candidates_speed:
+                                for cs in candidates_cs:
+                                    for no_rst in candidates_no_rst:
+                                        for no_backlight in candidates_no_backlight:
+                                            trial += 1
 
-                                        args = argparse.Namespace(**vars(base_args))
-                                        args.width = width
-                                        args.height = height
-                                        args.rotation = rotation
-                                        args.offset_top = offset_top
-                                        args.offset_left = offset_left
-                                        args.invert = invert
-                                        args.speed = speed
-                                        args.cs = cs
-                                        args.no_rst = no_rst
-                                        args.no_backlight = no_backlight
+                                            args = argparse.Namespace(**vars(base_args))
+                                            args.width = width
+                                            args.height = height
+                                            args.dc = dc
+                                            args.rst = rst
+                                            args.backlight = backlight
+                                            args.rotation = rotation
+                                            args.offset_top = offset_top
+                                            args.offset_left = offset_left
+                                            args.invert = invert
+                                            args.speed = speed
+                                            args.cs = cs
+                                            args.no_rst = no_rst
+                                            args.no_backlight = no_backlight
 
-                                        print(
-                                            f"\n[Trial {trial}] size={width}x{height} rot={rotation} top={offset_top} inv={invert} speed={speed/1_000_000:.0f}MHz cs={cs} no_rst={no_rst} no_bl={no_backlight}"
-                                        )
-                                        try:
-                                            display = _init_display(args)
-                                            img = Image.new('RGB', (display.width, display.height), color=(255, 0, 0))
-                                            draw = ImageDraw.Draw(img)
-                                            try:
-                                                font = ImageFont.truetype(
-                                                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18
-                                                )
-                                            except Exception:
-                                                font = ImageFont.load_default()
-
-                                            draw.rectangle([0, 0, display.width, 30], fill=(0, 0, 0))
-                                            draw.text(
-                                                (5, 6),
-                                                f"{width}x{height} r{rotation} t{offset_top} inv{int(invert)} {speed//1_000_000}M cs{cs} rst{int(not no_rst)}",
-                                                font=font,
-                                                fill=(255, 255, 255),
+                                            print(
+                                                f"\n[Trial {trial}] size={width}x{height} rot={rotation} top={offset_top} inv={invert} speed={speed/1_000_000:.0f}MHz cs={cs} dc={dc} rst={rst} bl={backlight} no_rst={no_rst} no_bl={no_backlight}"
                                             )
-                                            display.display(img)
-                                            time.sleep(2)
-                                        except Exception as e:
-                                            print(f"  init/display failed: {e}")
+                                            try:
+                                                display = _init_display(args)
+                                                img = Image.new('RGB', (display.width, display.height), color=(255, 0, 0))
+                                                draw = ImageDraw.Draw(img)
+                                                try:
+                                                    font = ImageFont.truetype(
+                                                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16
+                                                    )
+                                                except Exception:
+                                                    font = ImageFont.load_default()
+
+                                                draw.rectangle([0, 0, display.width, 34], fill=(0, 0, 0))
+                                                draw.text(
+                                                    (5, 6),
+                                                    f"{width}x{height} r{rotation} t{offset_top} cs{cs} dc{dc} rst{int(not no_rst)}",
+                                                    font=font,
+                                                    fill=(255, 255, 255),
+                                                )
+                                                display.display(img)
+                                                time.sleep(2)
+                                            except Exception as e:
+                                                print(f"  init/display failed: {e}")
 
 def test_display(args: argparse.Namespace) -> bool:
     """Test ST7789V3 display with various patterns and colors"""

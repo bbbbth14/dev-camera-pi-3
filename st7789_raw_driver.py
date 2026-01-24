@@ -117,6 +117,8 @@ class RawST7789:
         cs: int,
         dc: int,
         rst: int | None,
+        backlight: int | None = None,
+        backlight_active_high: bool = True,
         speed: int,
         spi_mode: int,
         width: int,
@@ -133,6 +135,8 @@ class RawST7789:
 
         self._dc = dc
         self._rst = rst
+        self._backlight = backlight
+        self._backlight_active_high = backlight_active_high
         self._rotation = rotation
         self._invert = invert
 
@@ -146,6 +150,12 @@ class RawST7789:
         GPIO.setup(self._dc, GPIO.OUT)
         if self._rst is not None:
             GPIO.setup(self._rst, GPIO.OUT)
+        if self._backlight is not None:
+            GPIO.setup(self._backlight, GPIO.OUT)
+            GPIO.output(
+                self._backlight,
+                GPIO.HIGH if self._backlight_active_high else GPIO.LOW,
+            )
 
         self._init()
 

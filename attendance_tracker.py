@@ -12,6 +12,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from zipfile import BadZipFile
+import json
 import config
 try:
     from openpyxl import Workbook, load_workbook
@@ -30,6 +31,7 @@ class AttendanceTracker:
         self.attendance_file = config.ATTENDANCE_FILE
         self.status_log_file = os.path.join(config.DATA_DIR, 'status_log.csv')
         self.user_ids_file = os.path.join(config.DATA_DIR, 'user_ids.csv')
+        self.last_event_file = os.path.join(config.DATA_DIR, 'last_event.json')
         self.last_checkin = {}  # Track last check-in time per person
         self.user_ids = {}  # Map user names to IDs
         self._excel_lock = threading.Lock()
@@ -66,6 +68,141 @@ class AttendanceTracker:
         self._load_today_checkins()
         
         print("[INFO] Attendance tracker initialized")
+
+    def _write_last_event(
+        self,
+        *,
+        name: str,
+        event: str,
+        event_dt: datetime,
+        user_id: str,
+        check_in_time: Optional[str] = None,
+        check_out_time: Optional[str] = None,
+        duration: Optional[str] = None,
+    ) -> None:
+        """Write the latest check-in/out event for LCD/web synchronization."""
+        payload = {
+            "ts": float(event_dt.timestamp()),
+            "date": event_dt.strftime('%Y-%m-%d'),
+            "time": event_dt.strftime('%H:%M:%S'),
+            "name": name,
+            "user_id": user_id,
+            "event": event,
+            "check_in_time": check_in_time,
+            "check_out_time": check_out_time,
+            "duration": duration,
+        }
+
+        try:
+            os.makedirs(os.path.dirname(self.last_event_file), exist_ok=True)
+            tmp_path = f"{self.last_event_file}.tmp-{os.getpid()}"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp_path, self.last_event_file)
+        except Exception as e:
+            print(f"[WARNING] Failed to write last event file: {e}")
+
+    def register_user(self, name: str) -> str:
+        """Ensure a user has an ID and exists in Excel (User Directory + monthly sheet)."""
+        user_id = self._get_or_create_user_id(name)
+
+        if EXCEL_AVAILABLE and os.path.exists(self.attendance_file):
+            try:
+                now = datetime.now()
+                with self._excel_lock:
+                    wb = load_workbook(self.attendance_file)
+                    self._get_or_create_user_sheet(wb, name, now)
+                    wb.save(self.attendance_file)
+                    wb.close()
+            except Exception as e:
+                print(f"[WARNING] Failed to ensure user sheet exists for {name}: {e}")
+
+        try:
+            self.update_user_directory()
+        except Exception:
+            pass
+
+        return user_id
+
+    def remove_user(self, name: str) -> bool:
+        """Remove user from user_ids + Excel (sheets and User Directory), and delete image folders best-effort."""
+        removed_any = False
+
+        # Update in-memory mapping
+        if name in self.user_ids:
+            del self.user_ids[name]
+            removed_any = True
+
+        # Rewrite user_ids.csv without this user
+        try:
+            if os.path.exists(self.user_ids_file):
+                rows: list[list[str]] = []
+                with open(self.user_ids_file, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        rows.append(row)
+
+                if rows:
+                    header = rows[0]
+                    body = [r for r in rows[1:] if len(r) == 0 or r[0] != name]
+                    with open(self.user_ids_file, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(header)
+                        writer.writerows(body)
+        except Exception as e:
+            print(f"[WARNING] Failed to update user_ids.csv for delete: {e}")
+
+        # Remove from Excel workbook
+        if EXCEL_AVAILABLE and os.path.exists(self.attendance_file):
+            try:
+                with self._excel_lock:
+                    wb = load_workbook(self.attendance_file)
+
+                    # Remove user monthly sheets
+                    for sheet_name in list(wb.sheetnames):
+                        if sheet_name.startswith(f"{name}_"):
+                            wb.remove(wb[sheet_name])
+                            removed_any = True
+
+                    # Remove from User Directory sheet if present
+                    if 'User Directory' in wb.sheetnames:
+                        ws = wb['User Directory']
+                        to_delete: list[int] = []
+                        for r in range(3, ws.max_row + 1):
+                            if ws.cell(r, 2).value == name:
+                                to_delete.append(r)
+                        for r in reversed(to_delete):
+                            ws.delete_rows(r, 1)
+                            removed_any = True
+
+                    wb.save(self.attendance_file)
+                    wb.close()
+            except Exception as e:
+                print(f"[WARNING] Failed to remove user from Excel: {e}")
+
+        # Remove local folders (best effort)
+        try:
+            import shutil
+
+            img_dir = os.path.join(config.IMAGES_DIR, name)
+            if os.path.isdir(img_dir):
+                shutil.rmtree(img_dir)
+                removed_any = True
+
+            faces_dir = os.path.join(config.FACES_DIR, name)
+            if os.path.isdir(faces_dir):
+                shutil.rmtree(faces_dir)
+                removed_any = True
+        except Exception as e:
+            print(f"[WARNING] Failed to remove user folders: {e}")
+
+        # Refresh directory sheet
+        try:
+            self.update_user_directory()
+        except Exception:
+            pass
+
+        return removed_any
     
     def _load_user_ids(self):
         """Load user IDs from file or create new file"""
@@ -127,37 +264,58 @@ class AttendanceTracker:
             
             with self._excel_lock:
                 wb = load_workbook(self.attendance_file)
-                
-                # Create or get User Directory sheet
+
+                # Recreate the sheet to guarantee the new layout (extra header line + more columns)
                 if 'User Directory' in wb.sheetnames:
-                    ws = wb['User Directory']
-                    # Clear existing data (keep header)
-                    ws.delete_rows(2, ws.max_row)
-                else:
-                    ws = wb.create_sheet('User Directory', 0)  # Insert at beginning
-                    
-                    # Create header
-                    ws.merge_cells('A1:E1')
-                    ws['A1'] = 'USER DIRECTORY'
-                    ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
-                    ws['A1'].fill = PatternFill(start_color="2E86AB", end_color="2E86AB", fill_type="solid")
-                    ws['A1'].alignment = Alignment(horizontal="center", vertical="center")
-                    
-                    # Column headers
-                    headers = ['#', 'Name', 'User ID', 'Enrolled Date', 'Total Attendance Days']
-                    ws.append(headers)
-                    
-                    for cell in ws[2]:
-                        cell.font = Font(bold=True, size=11)
-                        cell.fill = PatternFill(start_color="A8DADC", end_color="A8DADC", fill_type="solid")
-                        cell.alignment = Alignment(horizontal="center", vertical="center")
-                    
-                    # Set column widths
-                    ws.column_dimensions['A'].width = 6
-                    ws.column_dimensions['B'].width = 20
-                    ws.column_dimensions['C'].width = 15
-                    ws.column_dimensions['D'].width = 15
-                    ws.column_dimensions['E'].width = 22
+                    wb.remove(wb['User Directory'])
+
+                ws = wb.create_sheet('User Directory', 0)  # Insert at beginning
+
+                # Title header
+                ws.merge_cells('A1:J1')
+                ws['A1'] = 'USER DIRECTORY'
+                ws['A1'].font = Font(bold=True, size=14, color="FFFFFF")
+                ws['A1'].fill = PatternFill(start_color="2E86AB", end_color="2E86AB", fill_type="solid")
+                ws['A1'].alignment = Alignment(horizontal="center", vertical="center")
+
+                # Extra header line (requested)
+                ws.merge_cells('A2:J2')
+                ws['A2'] = f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                ws['A2'].font = Font(bold=False, size=10, color="FFFFFF")
+                ws['A2'].fill = PatternFill(start_color="2E86AB", end_color="2E86AB", fill_type="solid")
+                ws['A2'].alignment = Alignment(horizontal="center", vertical="center")
+
+                # Column headers
+                headers = [
+                    '#',
+                    'Name',
+                    'User ID',
+                    'Enrolled Date',
+                    'Total Working Days',
+                    'Days Late',
+                    'OT Days',
+                    'Total Hours',
+                    'Total Late',
+                    'Total OT',
+                ]
+                ws.append(headers)
+
+                for cell in ws[3]:
+                    cell.font = Font(bold=True, size=11)
+                    cell.fill = PatternFill(start_color="A8DADC", end_color="A8DADC", fill_type="solid")
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                # Set column widths
+                ws.column_dimensions['A'].width = 6   # #
+                ws.column_dimensions['B'].width = 20  # Name
+                ws.column_dimensions['C'].width = 15  # User ID
+                ws.column_dimensions['D'].width = 15  # Enrolled Date
+                ws.column_dimensions['E'].width = 18  # Total Working Days
+                ws.column_dimensions['F'].width = 10  # Days Late
+                ws.column_dimensions['G'].width = 10  # OT Days
+                ws.column_dimensions['H'].width = 14  # Total Hours
+                ws.column_dimensions['I'].width = 12  # Total Late
+                ws.column_dimensions['J'].width = 12  # Total OT
                 
                 # Get all users from user_ids
                 users = sorted(self.user_ids.items(), key=lambda x: x[0])
@@ -167,6 +325,11 @@ class AttendanceTracker:
                     # Try to find enrollment date from first attendance
                     enrolled_date = "N/A"
                     total_days = 0
+                    days_late = 0
+                    ot_days = 0
+                    total_hours_minutes = 0
+                    total_late_minutes = 0
+                    total_ot_minutes = 0
                     
                     # Count total attendance days across all sheets
                     for sheet_name in wb.sheetnames:
@@ -174,31 +337,63 @@ class AttendanceTracker:
                             # This is a user sheet
                             user_sheet = wb[sheet_name]
                             
-                            # Count days with attendance (has First In value)
+                            # Count totals across all days
                             for row in user_sheet.iter_rows(min_row=3, values_only=True):
-                                if len(row) > 2 and row[2]:  # Has First In time
+                                if len(row) < 8:
+                                    continue
+
+                                date_val = row[0]
+                                first_in = row[2]
+                                total_hours = row[4]
+                                status = row[5]
+                                time_late = row[6]
+                                time_ot = row[7]
+
+                                if first_in:
                                     total_days += 1
                                     # Get earliest date as enrollment date
-                                    if enrolled_date == "N/A" and row[0]:
-                                        enrolled_date = row[0] if isinstance(row[0], str) else row[0].strftime('%Y-%m-%d')
+                                    if enrolled_date == "N/A" and date_val:
+                                        enrolled_date = date_val if isinstance(date_val, str) else date_val.strftime('%Y-%m-%d')
+
+                                if status == 'LATE':
+                                    days_late += 1
+
+                                if total_hours:
+                                    total_hours_minutes += self._parse_time_to_minutes(str(total_hours))
+
+                                if time_late and str(time_late).strip() not in {'0m', '0', ''}:
+                                    total_late_minutes += self._parse_time_to_minutes(str(time_late))
+
+                                if time_ot and str(time_ot).strip() not in {'0m', '0', ''}:
+                                    ot_days += 1
+                                    total_ot_minutes += self._parse_time_to_minutes(str(time_ot))
                     
                     # If no attendance, use today as enrolled date
                     if enrolled_date == "N/A":
                         enrolled_date = datetime.now().strftime('%Y-%m-%d')
-                    
-                    row_data = [idx, name, user_id, enrolled_date, total_days]
+
+                    row_data = [
+                        idx,
+                        name,
+                        user_id,
+                        enrolled_date,
+                        total_days,
+                        days_late,
+                        ot_days,
+                        self._format_time_from_minutes(total_hours_minutes),
+                        self._format_time_from_minutes(total_late_minutes),
+                        self._format_time_from_minutes(total_ot_minutes),
+                    ]
                     ws.append(row_data)
                     
                     # Format the row
                     row_num = ws.max_row
-                    ws.cell(row_num, 1).alignment = Alignment(horizontal="center")
-                    ws.cell(row_num, 3).alignment = Alignment(horizontal="center")
-                    ws.cell(row_num, 4).alignment = Alignment(horizontal="center")
-                    ws.cell(row_num, 5).alignment = Alignment(horizontal="center")
+                    for col in range(1, 11):
+                        ws.cell(row_num, col).alignment = Alignment(horizontal="center")
                     
                     # Alternate row colors
                     if idx % 2 == 0:
-                        for col in range(1, 6):
+                        for col in range(1, 11):
                             ws.cell(row_num, col).fill = PatternFill(start_color="F1FAEE", end_color="F1FAEE", fill_type="solid")
                 
                 # Add summary at bottom
@@ -456,6 +651,13 @@ class AttendanceTracker:
             now = datetime.now()
             date_str = now.strftime('%Y-%m-%d')
             time_str = now.strftime('%H:%M:%S')
+
+            # Ensure user has an ID (also used for LCD sync payload)
+            user_id = self._get_or_create_user_id(name)
+
+            check_in_time: Optional[str] = None
+            check_out_time: Optional[str] = None
+            duration_str: Optional[str] = None
             
             with self._excel_lock:
                 wb = load_workbook(self.attendance_file)
@@ -526,8 +728,12 @@ class AttendanceTracker:
                             in_dt = datetime.strptime(time_in, "%H:%M:%S")
                             out_dt = datetime.strptime(time_str, "%H:%M:%S")
                             duration = out_dt - in_dt
-                            hours = duration.seconds // 3600
-                            minutes = (duration.seconds % 3600) // 60
+                            total_seconds = int(duration.total_seconds())
+                            # If clocks wrap or parse issues cause negative, treat as next-day wrap.
+                            if total_seconds < 0:
+                                total_seconds += 24 * 3600
+                            hours = total_seconds // 3600
+                            minutes = (total_seconds % 3600) // 60
                             total_str = f"{hours}h {minutes}m"
                             ws.cell(user_row, 5, total_str)  # Total Hours
                             
@@ -550,6 +756,11 @@ class AttendanceTracker:
                                 ws.cell(user_row, 8, '0m')
                         except Exception as calc_err:
                             print(f"[WARN] Failed to calculate time: {calc_err}")
+
+                # Capture values for LCD sync after the updates
+                check_in_time = ws.cell(user_row, 3).value or None
+                check_out_time = ws.cell(user_row, 4).value or None
+                duration_str = ws.cell(user_row, 5).value or None
                 
                 wb.save(self.attendance_file)
                 wb.close()
@@ -562,6 +773,18 @@ class AttendanceTracker:
                 self.last_checkin[name] = now
             
             print(f"[INFO] Recorded: {name} - {event} at {time_str}")
+
+            # Write a small sync file so the LCD process can show CHECK IN/OUT instantly
+            if event in {'CHECK_IN', 'CHECK_OUT'}:
+                self._write_last_event(
+                    name=name,
+                    event=event,
+                    event_dt=now,
+                    user_id=user_id,
+                    check_in_time=check_in_time,
+                    check_out_time=check_out_time,
+                    duration=duration_str,
+                )
             return True
             
         except Exception as e:
@@ -715,9 +938,9 @@ class AttendanceTracker:
             with self._excel_lock:
                 wb = load_workbook(self.attendance_file)
                 
-                # Iterate through all sheets (except Template)
+                # Iterate through user monthly sheets only
                 for sheet_name in wb.sheetnames:
-                    if sheet_name == 'Template':
+                    if sheet_name in {'Template', 'User Directory', 'Attendance', 'Monthly Report'}:
                         continue
                     
                     ws = wb[sheet_name]
@@ -747,7 +970,13 @@ class AttendanceTracker:
                                 ot_cutoff = datetime.strptime("17:00:00", "%H:%M:%S").time()
                                 if current_time > ot_cutoff:
                                     is_ot = True
-                            
+
+                            # IMPORTANT: If there's no check-in time, the user is NOT checked in.
+                            # Previously we treated "no time_out" as IN, which caused false IN states
+                            # and then "Refusing CHECK OUT - no check-in time".
+                            if not time_in:
+                                break  # Found today's row, but user hasn't checked in yet
+
                             user_status[name] = {
                                 'last_event': 'CHECK_OUT' if time_out else 'CHECK_IN',
                                 'last_time': time_out if time_out else time_in,

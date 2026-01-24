@@ -116,16 +116,14 @@ def capture_face_samples(name: str, num_samples: int = 5):
     if best_sample is not None and samples_captured > 0:
         print(f"\n[INFO] Adding {name} to face database...")
         if recognizer.add_face(name, best_sample):
-            # Generate and save User ID
+            # Generate and save User ID + ensure Excel directory is updated
             tracker = AttendanceTracker()
-            user_id = tracker._get_or_create_user_id(name)
+            user_id = tracker.register_user(name)
             
             print(f"[SUCCESS] {name} enrolled successfully!")
             print(f"[SUCCESS] User ID assigned: {user_id}")
             print(f"[INFO] Total known faces: {len(recognizer.list_known_faces())}")
             
-            # Update User Directory in Excel
-            tracker.update_user_directory()
             print(f"[INFO] User directory updated in Excel")
             
             return True

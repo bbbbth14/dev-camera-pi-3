@@ -27,6 +27,16 @@ except Exception as e:
     LCD_AVAILABLE = False
     print(f"[INFO] ST7789 not available - LCD display disabled ({e})")
 
+# The repo now uses a dedicated LCD process (display_attendance.py) + last_event.json sync.
+# To avoid SPI contention and duplicated on-screen messages, keep the web app's internal
+# LCD code disabled by default. You can force-enable it with ENABLE_WEB_LCD=1.
+if os.environ.get("ENABLE_WEB_LCD") != "1":
+    LCD_AVAILABLE = False
+    if os.environ.get("DISABLE_WEB_LCD") == "1":
+        print("[INFO] Web internal LCD disabled (DISABLE_WEB_LCD=1)")
+    else:
+        print("[INFO] Web internal LCD disabled by default (set ENABLE_WEB_LCD=1 to enable)")
+
 app = Flask(__name__)
 
 # Global state
@@ -332,6 +342,10 @@ def camera_loop():
                                         filepath = os.path.join(user_dir, filename)
                                         cv2.imwrite(filepath, img)
                                     state.recognizer.train()
+                                    try:
+                                        state.tracker.register_user(state.enroll_name)
+                                    except Exception as e:
+                                        state.add_log(f"[WARN] Failed to update Excel directory for {state.enroll_name}: {e}")
                                     state.add_log(f"✓ {state.enroll_name} enrolled successfully")
                                     # Set success notification
                                     state.enrollment_success = True
@@ -531,19 +545,27 @@ def api_enroll_save():
         return jsonify({'success': False, 'message': f'Need at least 3 images, got {len(state.enroll_images)}'})
     
     try:
+        enrolled_name = state.enroll_name
+
         # Create user directory
-        user_dir = os.path.join(config.IMAGES_DIR, state.enroll_name)
+        user_dir = os.path.join(config.IMAGES_DIR, enrolled_name)
         os.makedirs(user_dir, exist_ok=True)
         
         # Save images
         for idx, img in enumerate(state.enroll_images):
-            filename = f"{state.enroll_name}_{idx+1}.jpg"
+            filename = f"{enrolled_name}_{idx+1}.jpg"
             filepath = os.path.join(user_dir, filename)
             cv2.imwrite(filepath, img)
+
+        # Ensure user is registered in Excel (User Directory + ID)
+        try:
+            state.tracker.register_user(enrolled_name)
+        except Exception as e:
+            state.add_log(f"[WARN] Failed to update Excel directory for {enrolled_name}: {e}")
         
         # Retrain
         state.recognizer.train()
-        state.add_log(f"✓ Enrolled {state.enroll_name} ({len(state.enroll_images)} images)")
+        state.add_log(f"✓ Enrolled {enrolled_name} ({len(state.enroll_images)} images)")
         
         # Reset enrollment state
         state.enrolling = False
@@ -575,7 +597,13 @@ def api_delete_user(name):
     try:
         import shutil
         
-        # Remove user directory
+        # Remove user from Excel/user_ids and local folders
+        try:
+            state.tracker.remove_user(name)
+        except Exception as e:
+            state.add_log(f"[WARN] Failed to remove user from Excel: {e}")
+
+        # Also remove user directory (in case tracker removal didn't)
         user_dir = os.path.join(config.IMAGES_DIR, name)
         if os.path.exists(user_dir):
             shutil.rmtree(user_dir)

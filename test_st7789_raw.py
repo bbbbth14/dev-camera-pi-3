@@ -238,6 +238,11 @@ def _build_parser() -> argparse.ArgumentParser:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--quick", action="store_true")
     mode.add_argument("--full", action="store_true")
+    mode.add_argument(
+        "--scan",
+        action="store_true",
+        help="cycle common modes/offsets/rotations/pins until you see pixels",
+    )
 
     p.add_argument("--port", type=int, default=0)
     p.add_argument("--cs", type=int, default=0, choices=[0, 1])
@@ -337,6 +342,88 @@ def run_full(d: RawST7789) -> None:
     time.sleep(2)
 
 
+def run_scan(base_args: argparse.Namespace) -> None:
+    print("\nSCAN MODE (RAW)")
+    print("- Watch the LCD. When you see ANYTHING, note the printed config.")
+    print("- If nothing ever appears, DC/RST/CS wiring is likely wrong.")
+
+    # Common variations across ST7789/ST7789V3 modules.
+    candidates_size = [(240, 240), (240, 280), (240, 320)]
+    candidates_rotation = [0, 90, 180, 270]
+    candidates_offset_top = [0, 20, 40, 60, 80, 100, 120]
+    candidates_offset_left = [0]
+    candidates_invert = [True, False]
+    candidates_speed = [4_000_000, 8_000_000, 12_000_000, 16_000_000, 24_000_000]
+    candidates_spi_mode = [0, 3, 1, 2]
+    candidates_cs = [0, 1]
+    candidates_no_rst = [False, True]
+
+    # Try a few very common DC/RST BCM sets (in addition to user-provided).
+    candidates_pin_sets = [
+        (base_args.dc, base_args.rst),
+        (25, 24),
+        (9, 25),
+        (27, 22),
+    ]
+
+    trial = 0
+    for width, height in candidates_size:
+        for dc, rst in candidates_pin_sets:
+            for rotation in candidates_rotation:
+                for offset_top in candidates_offset_top:
+                    for offset_left in candidates_offset_left:
+                        for invert in candidates_invert:
+                            for speed in candidates_speed:
+                                for spi_mode in candidates_spi_mode:
+                                    for cs in candidates_cs:
+                                        for no_rst in candidates_no_rst:
+                                            trial += 1
+                                            args = argparse.Namespace(**vars(base_args))
+                                            args.width = width
+                                            args.height = height
+                                            args.dc = dc
+                                            args.rst = rst
+                                            args.rotation = rotation
+                                            args.offset_top = offset_top
+                                            args.offset_left = offset_left
+                                            args.invert = invert
+                                            args.speed = speed
+                                            args.spi_mode = spi_mode
+                                            args.cs = cs
+                                            args.no_rst = no_rst
+
+                                            dc_bcm = _phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc
+                                            rst_bcm = None
+                                            if not args.no_rst:
+                                                rst_bcm = _phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst
+
+                                            print(
+                                                f"[Trial {trial}] {width}x{height} r{rotation} top{offset_top} inv{int(invert)} "
+                                                f"{speed//1_000_000}MHz mode{spi_mode} cs{cs} dc{dc_bcm} rst{('none' if rst_bcm is None else rst_bcm)}"
+                                            )
+                                            try:
+                                                d = RawST7789(
+                                                    port=args.port,
+                                                    cs=args.cs,
+                                                    dc=dc_bcm,
+                                                    rst=rst_bcm,
+                                                    speed=args.speed,
+                                                    spi_mode=args.spi_mode,
+                                                    width=args.width,
+                                                    height=args.height,
+                                                    offset_left=args.offset_left,
+                                                    offset_top=args.offset_top,
+                                                    rotation=args.rotation,
+                                                    invert=args.invert,
+                                                )
+                                                try:
+                                                    run_quick(d)
+                                                finally:
+                                                    d.close()
+                                            except Exception as e:
+                                                print(f"  init/display failed: {e}")
+
+
 def main() -> int:
     args = _build_parser().parse_args()
 
@@ -351,6 +438,10 @@ def main() -> int:
         f"dc={dc} rst={'none' if rst is None else rst} size={args.width}x{args.height} "
         f"offset=({args.offset_left},{args.offset_top}) rotation={args.rotation} invert={args.invert}"
     )
+
+    if args.scan:
+        run_scan(args)
+        return 0
 
     d = RawST7789(
         port=args.port,

@@ -12,6 +12,10 @@ ENV/
 data/faces/*.pkl
 data/images/*
 data/*.csv
+data/last_event.json
+data/*.bak-*
+data/*.csv.bak-*
+data/*.xlsx.bak-*
 !data/.gitkeep
 
 # IDE

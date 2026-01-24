@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import os
 import csv
+import json
 from attendance_tracker import AttendanceTracker
 
 from st7789_raw_driver import RawST7789, phys_to_bcm
@@ -42,12 +43,18 @@ class AttendanceDisplay:
         try:
             dc_gpio = phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc
             rst_gpio = None if args.no_rst else (phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst)
+            backlight_gpio = None
+            if not args.no_backlight:
+                backlight_gpio = (
+                    phys_to_bcm(args.backlight_phys) if args.backlight_phys is not None else args.backlight
+                )
 
             self.display = RawST7789(
                 port=args.port,
                 cs=args.cs,
                 dc=dc_gpio,
                 rst=rst_gpio,
+                backlight=backlight_gpio,
                 speed=args.speed,
                 spi_mode=args.spi_mode,
                 width=args.width,
@@ -71,6 +78,11 @@ class AttendanceDisplay:
                 cs=args.cs,
                 dc=(phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc),
                 rst=(phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst),
+                backlight=(
+                    None
+                    if args.no_backlight
+                    else (phys_to_bcm(args.backlight_phys) if args.backlight_phys is not None else args.backlight)
+                ),
                 spi_speed_hz=args.speed,
                 offset_left=args.offset_left,
                 offset_top=args.offset_top,
@@ -85,15 +97,134 @@ class AttendanceDisplay:
             self.font_info = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
             self.font_time = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
             self.font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+            self.font_flash = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
         except:
             self.font_title = ImageFont.load_default()
             self.font_name = ImageFont.load_default()
             self.font_info = ImageFont.load_default()
             self.font_time = ImageFont.load_default()
             self.font_small = ImageFont.load_default()
+            self.font_flash = ImageFont.load_default()
         
         self.tracker = AttendanceTracker()
         print("✓ Display initialized")
+
+        # Make it obvious immediately if pixels are updating.
+        try:
+            if getattr(self, "_raw_backend", False) and hasattr(self.display, "fill_rgb565"):
+                # Blue-ish screen in RGB565
+                self.display.fill_rgb565(0x00, 0x1F)
+        except Exception:
+            pass
+
+        # UI state
+        self._prev_status: dict[str, dict] = {}
+        self._flash_until: float = 0.0
+        self._flash_text: str | None = None
+        self._current_user: str | None = None
+        self._last_event_seen_ts: float = 0.0
+
+        # If the tracker supports last_event.json, prefer it to avoid duplicate flashes.
+        self._event_sync_path = getattr(self.tracker, "last_event_file", None)
+
+    def _read_last_event(self) -> dict | None:
+        try:
+            path = getattr(self.tracker, "last_event_file", None)
+            if not path or not os.path.exists(path):
+                return None
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _parse_hms(self, t: str | None) -> datetime | None:
+        if not t:
+            return None
+        try:
+            # Stored as HH:MM:SS
+            dt = datetime.strptime(t, "%H:%M:%S")
+            now = datetime.now()
+            return dt.replace(year=now.year, month=now.month, day=now.day)
+        except Exception:
+            return None
+
+    def _format_duration(self, seconds: int) -> str:
+        if seconds < 0:
+            seconds = 0
+        minutes = seconds // 60
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours}h {mins}m"
+
+    def _day_total_str(self, info: dict) -> str:
+        # Prefer stored Excel duration when available.
+        total = info.get("duration")
+        if total and str(total).strip() not in {"N/A", "None"}:
+            return str(total)
+
+        time_in = self._parse_hms(info.get("check_in_time"))
+        if not time_in:
+            return "0h 0m"
+
+        time_out = self._parse_hms(info.get("check_out_time"))
+        end = time_out if time_out else datetime.now()
+        return self._format_duration(int((end - time_in).total_seconds()))
+
+    def _pick_display_user(self, user_status: dict[str, dict]) -> str | None:
+        if not user_status:
+            return None
+
+        # If the currently displayed user is still present, keep it.
+        if self._current_user and self._current_user in user_status:
+            return self._current_user
+
+        # Otherwise, show the most recent activity.
+        def sort_key(item):
+            info = item[1] or {}
+            t = self._parse_hms(info.get("last_time"))
+            return t.timestamp() if t else 0
+
+        name, _ = max(user_status.items(), key=sort_key)
+        return name
+
+    def _detect_event_flash(self, prev: dict[str, dict], curr: dict[str, dict]) -> str | None:
+        # Detect transitions and return flash text.
+        events: list[tuple[float, str]] = []
+
+        names = set(prev.keys()) | set(curr.keys())
+        for name in names:
+            p = prev.get(name)
+            c = curr.get(name)
+
+            p_status = (p or {}).get("status")
+            c_status = (c or {}).get("status")
+
+            # New user appeared today with a check-in.
+            if p is None and c_status == "IN":
+                t = self._parse_hms((c or {}).get("check_in_time"))
+                # events.append(((t.timestamp() if t else time.time()), ""))
+                continue
+
+            # OUT -> IN (re-check-in after clearing last out)
+            if p_status == "OUT" and c_status == "IN":
+                t = self._parse_hms((c or {}).get("check_in_time"))
+                # events.append(((t.timestamp() if t else time.time()), ""))
+                continue
+
+            # IN -> OUT
+            if p_status == "IN" and c_status == "OUT":
+                t = self._parse_hms((c or {}).get("check_out_time"))
+                # events.append(((t.timestamp() if t else time.time()), "CHECK OUT SUCCESS"))
+                continue
+
+        if not events:
+            return None
+
+        events.sort(key=lambda x: x[0], reverse=True)
+        return events[0][1]
     
     def draw_header(self, draw):
         """Draw header section"""
@@ -109,72 +240,141 @@ class AttendanceDisplay:
         
         # Border line
         draw.line([0, 35, DISPLAY_WIDTH, 35], fill=BORDER_COLOR, width=2)
-    
-    def draw_user_status(self, draw, y_position, name, status_info):
-        """Draw individual user status - simplified view"""
-        # User card background
-        card_height = 40
-        draw.rectangle([5, y_position, DISPLAY_WIDTH - 5, y_position + card_height], 
-                      fill=(20, 60, 40), outline=(46, 204, 113))
-        
+
+    def _draw_flash(self, draw, action_text: str):
+        draw.rectangle([0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT], fill=(0, 0, 0))
+
+        # Two-line centered message for small LCD
+        # Defensive: if any caller accidentally passes "... SUCCESS ...", strip it.
+        line1 = (action_text or "").replace("SUCCESS", "").replace("SUCCESS", "")
+        line1 = " ".join(line1.split())
+        line2 = "SUCCESS"
+
+        # Pick a font size that fits the screen width.
+        flash_font = self.font_flash
+        try:
+            for size in (28, 24, 20, 18):
+                candidate = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+                b2 = draw.textbbox((0, 0), line2, font=candidate)
+                w2 = b2[2] - b2[0]
+                if w2 <= DISPLAY_WIDTH - 20:
+                    flash_font = candidate
+                    break
+        except Exception:
+            pass
+
+        b1 = draw.textbbox((0, 0), line1, font=flash_font)
+        w1 = b1[2] - b1[0]
+        h1 = b1[3] - b1[1]
+
+        b2 = draw.textbbox((0, 0), line2, font=flash_font)
+        w2 = b2[2] - b2[0]
+        h2 = b2[3] - b2[1]
+
+        gap = 10
+        total_h = h1 + gap + h2
+        y0 = (DISPLAY_HEIGHT - total_h) // 2
+
+        draw.text(((DISPLAY_WIDTH - w1) // 2, y0), line1, font=flash_font, fill=TEXT_COLOR)
+        draw.text(((DISPLAY_WIDTH - w2) // 2, y0 + h1 + gap), line2, font=flash_font, fill=TEXT_COLOR)
+
+    def _draw_single_user(self, draw, name: str, info: dict):
+        # Background
+        draw.rectangle([0, 35, DISPLAY_WIDTH, DISPLAY_HEIGHT], fill=BG_COLOR)
+
+        status = info.get("status", "OUT")
+        color = STATUS_IN_COLOR if status == "IN" else STATUS_OUT_COLOR
+
         # Name
-        draw.text((10, y_position + 5), name[:15], font=self.font_name, fill=TEXT_COLOR)
-        
-        # SUCCESS badge
-        draw.rectangle([DISPLAY_WIDTH - 80, y_position + 5, DISPLAY_WIDTH - 10, y_position + 22], 
-                      fill=STATUS_IN_COLOR)
-        draw.text((DISPLAY_WIDTH - 75, y_position + 7), "SUCCESS", font=self.font_small, fill=(255, 255, 255))
-        
-        # Time (last activity time)
-        time_text = status_info.get('last_time', 'N/A')
-        draw.text((10, y_position + 24), f"Time: {time_text}", font=self.font_time, fill=TIME_COLOR)
+        draw.text((10, 48), name[:18], font=self.font_title, fill=TEXT_COLOR)
+        # Status badge
+        draw.rectangle([10, 78, 110, 98], fill=color)
+        draw.text((16, 80), status, font=self.font_small, fill=(0, 0, 0))
+
+        # Times
+        time_in = info.get("check_in_time") or "--:--:--"
+        time_out = info.get("check_out_time") or "--:--:--"
+        total = self._day_total_str(info)
+
+        draw.text((10, 110), f"Time IN : {time_in}", font=self.font_info, fill=TEXT_COLOR)
+        draw.text((10, 132), f"Time OUT: {time_out}", font=self.font_info, fill=TEXT_COLOR)
+        draw.text((10, 154), f"Total  : {total}", font=self.font_info, fill=TIME_COLOR)
+
+        # Footer clock
+        update_time = datetime.now().strftime("%H:%M:%S")
+        draw.text((10, DISPLAY_HEIGHT - 18), update_time, font=self.font_small, fill=(120, 120, 120))
     
     def update_display(self):
         """Update display with current attendance data"""
         # Create new image
         img = Image.new('RGB', (DISPLAY_WIDTH, DISPLAY_HEIGHT), color=BG_COLOR)
         draw = ImageDraw.Draw(img)
-        
-        # Draw header
-        self.draw_header(draw)
-        
+
+        # Prefer event-driven sync: show CHECK IN/OUT success immediately when recorded.
+        last_event = self._read_last_event()
+        if last_event and last_event.get('event') in {'CHECK_IN', 'CHECK_OUT'}:
+            try:
+                evt_ts = float(last_event.get('ts') or 0.0)
+            except Exception:
+                evt_ts = 0.0
+
+            if evt_ts > self._last_event_seen_ts:
+                self._last_event_seen_ts = evt_ts
+                self._current_user = str(last_event.get('name') or '') or self._current_user
+
+                action = "CHECK IN" if last_event.get('event') == 'CHECK_IN' else "CHECK OUT"
+                self._draw_flash(draw, action)
+                self.display.display(img)
+
+                # Keep the splash visible for a full 2 seconds.
+                time.sleep(2.0)
+
+                # After splash, fall through and render the normal screen immediately.
+                img = Image.new('RGB', (DISPLAY_WIDTH, DISPLAY_HEIGHT), color=BG_COLOR)
+                draw = ImageDraw.Draw(img)
+                self._flash_text = None
+                self._flash_until = 0.0
+
         # Get user status
         user_status = self.tracker.get_user_status()
-        
-        if not user_status:
-            # No users message
-            draw.text((DISPLAY_WIDTH // 2 - 40, DISPLAY_HEIGHT // 2), 
-                     "No users yet", font=self.font_info, fill=(150, 150, 150))
-        else:
-            # Display users (max 5 visible at once)
-            y_pos = 40
-            count = 0
-            max_users = 5
-            
-            # Sort by most recent activity
-            def _sort_key(item):
-                info = item[1] or {}
-                # last_time can exist but be None -> keep key always comparable
-                return info.get('last_time') or ''
 
-            sorted_users = sorted(user_status.items(), key=_sort_key, reverse=True)
-            
-            for name, status_info in sorted_users[:max_users]:
-                self.draw_user_status(draw, y_pos, name, status_info)
-                y_pos += 45
-                count += 1
-            
-            # Show total if more users exist
-            if len(user_status) > max_users:
-                remaining = len(user_status) - max_users
-                draw.text((10, DISPLAY_HEIGHT - 15), 
-                         f"+{remaining} more", font=self.font_small, fill=(150, 150, 150))
-        
-        # Display update time
-        update_time = datetime.now().strftime("%H:%M:%S")
-        draw.text((DISPLAY_WIDTH - 60, DISPLAY_HEIGHT - 15), 
-                 update_time, font=self.font_small, fill=(100, 100, 100))
-        
+        # If we just handled a real event, don't also trigger the old transition flash.
+        event_sync_available = bool(self._event_sync_path)
+        if event_sync_available:
+            self._prev_status = user_status
+        else:
+            # Detect check-in/out transitions and trigger flash (legacy fallback)
+            flash = self._detect_event_flash(self._prev_status, user_status)
+            if flash:
+                # Map legacy messages to our two-line splash format
+                action = "CHECK IN" if "CHECK IN" in flash else "CHECK OUT"
+                self._flash_text = action
+                self._flash_until = time.time() + 2.0
+
+            self._prev_status = user_status
+
+        # If flash active, render it full-screen
+        if self._flash_text and time.time() < self._flash_until:
+            self._draw_flash(draw, self._flash_text)
+            self.display.display(img)
+            return
+
+        # Normal screen
+        self.draw_header(draw)
+
+        name = self._pick_display_user(user_status)
+        self._current_user = name
+
+        if not name:
+            draw.text(
+                (DISPLAY_WIDTH // 2 - 50, DISPLAY_HEIGHT // 2),
+                "No check-ins yet",
+                font=self.font_info,
+                fill=(150, 150, 150),
+            )
+        else:
+            self._draw_single_user(draw, name, user_status.get(name, {}))
+
         # Update display
         self.display.display(img)
     
@@ -235,6 +435,14 @@ def main():
     parser.add_argument("--no-rst", action="store_true")
     parser.add_argument("--dc-phys", type=int, default=22, help="physical pin for DC (default: 22)")
     parser.add_argument("--rst-phys", type=int, default=18, help="physical pin for RST (default: 18)")
+
+    parser.add_argument("--backlight", type=int, default=18, help="BCM GPIO for BL/BLK")
+    parser.add_argument("--backlight-phys", type=int, default=12, help="physical pin for BL/BLK (default: 12)")
+    parser.add_argument(
+        "--no-backlight",
+        action="store_true",
+        help="do not control backlight via GPIO (use when BLK is tied to 3.3V)",
+    )
 
     args = parser.parse_args()
 
