@@ -1,49 +1,269 @@
 #!/usr/bin/env python3
-"""
-Test script for ST7789 SPI Display
-Tests basic functionality, colors, and text display
+"""test_st7789.py
+
+ST7789/ST7789V3 SPI display test.
+
+This repo’s other tools (e.g. `display_attendance.py`, `check_st7789_wiring.py`)
+use the following *default* wiring, so this test does too:
+
+- SPI: port 0, CS0 (CE0 / GPIO 8)
+- DC: GPIO 25
+- RST: GPIO 24
+- Backlight: GPIO 18
+- Rotation: 90
+
+If your module differs (some 240x240 panels need offsets, some use different
+GPIOs), pass overrides via CLI flags.
 """
 
+import argparse
 import time
+
 import st7789
 from PIL import Image, ImageDraw, ImageFont
 
-# Display configuration
-# Common ST7789 configurations:
-# - 240x240 (square display)
-# - 240x320 (rectangular display)
 
-def test_display():
-    """Test ST7789 display with various patterns and colors"""
+_PHYS_TO_BCM = {
+    # Power pins (no BCM mapping): 1=3V3, 2=5V, 4=5V, 6/9/14/20/25/30/34/39=GND
+    3: 2,
+    5: 3,
+    7: 4,
+    8: 14,
+    10: 15,
+    11: 17,
+    12: 18,
+    13: 27,
+    15: 22,
+    16: 23,
+    18: 24,
+    19: 10,
+    21: 9,
+    22: 25,
+    23: 11,
+    24: 8,
+    26: 7,
+    27: 0,
+    28: 1,
+    29: 5,
+    31: 6,
+    32: 12,
+    33: 13,
+    35: 19,
+    36: 16,
+    37: 26,
+    38: 20,
+    40: 21,
+}
+
+
+def _phys_to_bcm(phys_pin: int) -> int:
+    bcm = _PHYS_TO_BCM.get(phys_pin)
+    if bcm is None:
+        raise ValueError(
+            f"Physical pin {phys_pin} is not a GPIO pin (or is unsupported). "
+            "Use a GPIO-capable physical pin like 12, 18, 22, 23, 24, etc."
+        )
+    return bcm
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ST7789/ST7789V3 display test")
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--quick", action="store_true", help="run a quick sanity test")
+    mode.add_argument("--full", action="store_true", help="run the full test suite (default)")
+    mode.add_argument(
+        "--scan",
+        action="store_true",
+        help="cycle common rotation/offset/invert settings until you see an image",
+    )
+
+    parser.add_argument("--rotation", type=int, default=90, choices=[0, 90, 180, 270])
+    parser.add_argument("--port", type=int, default=0, help="SPI port (usually 0)")
+    parser.add_argument("--cs", type=int, default=0, choices=[0, 1], help="SPI chip select (0=CE0, 1=CE1)")
+    parser.add_argument("--dc", type=int, default=25, help="GPIO for DC/RS")
+    parser.add_argument("--rst", type=int, default=24, help="GPIO for RST/RES")
+    parser.add_argument("--backlight", type=int, default=18, help="GPIO for backlight (BL/BLK)")
+
+    parser.add_argument(
+        "--dc-phys",
+        type=int,
+        default=None,
+        help="physical header pin for DC/RS (e.g. 22 for GPIO25)",
+    )
+    parser.add_argument(
+        "--rst-phys",
+        type=int,
+        default=None,
+        help="physical header pin for RST/RES (e.g. 18 for GPIO24)",
+    )
+    parser.add_argument(
+        "--backlight-phys",
+        type=int,
+        default=None,
+        help="physical header pin for BL/BLK (e.g. 12 for GPIO18)",
+    )
+    parser.add_argument(
+        "--no-backlight",
+        action="store_true",
+        help="do not control backlight via GPIO (use when BLK is tied to 3.3V)",
+    )
+    parser.add_argument(
+        "--no-rst",
+        action="store_true",
+        help="do not use a reset GPIO (use when RST is not connected)",
+    )
+    parser.add_argument(
+        "--speed",
+        type=int,
+        default=4_000_000,
+        help="SPI speed in Hz (start low; raise once working)",
+    )
+
+    invert = parser.add_mutually_exclusive_group()
+    invert.add_argument("--invert", dest="invert", action="store_true", help="enable color invert")
+    invert.add_argument("--no-invert", dest="invert", action="store_false", help="disable color invert")
+    parser.set_defaults(invert=True)
+
+    parser.add_argument("--width", type=int, default=None, help="override panel width")
+    parser.add_argument("--height", type=int, default=None, help="override panel height")
+    parser.add_argument("--offset-left", type=int, default=None, help="optional left offset")
+    parser.add_argument("--offset-top", type=int, default=None, help="optional top offset")
+
+    return parser
+
+
+def _init_display(args: argparse.Namespace):
+    dc_gpio = _phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc
+    rst_gpio = _phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst
+    backlight_gpio = (
+        _phys_to_bcm(args.backlight_phys) if args.backlight_phys is not None else args.backlight
+    )
+
+    kwargs = dict(
+        rotation=args.rotation,
+        port=args.port,
+        cs=args.cs,
+        dc=dc_gpio,
+        invert=args.invert,
+        spi_speed_hz=args.speed,
+    )
+
+    if not args.no_rst:
+        kwargs["rst"] = rst_gpio
+
+    if not args.no_backlight:
+        kwargs["backlight"] = backlight_gpio
+
+    if args.width is not None:
+        kwargs["width"] = args.width
+    if args.height is not None:
+        kwargs["height"] = args.height
+    if args.offset_left is not None:
+        kwargs["offset_left"] = args.offset_left
+    if args.offset_top is not None:
+        kwargs["offset_top"] = args.offset_top
+
+    return st7789.ST7789(**kwargs)
+
+
+def scan_for_working_config(base_args: argparse.Namespace) -> None:
+    """Cycle common configs. Stop when you see any image."""
+    candidates_rotation = [0, 90, 180, 270]
+    # 240x280 panels often need a top offset (commonly ~20), but varies by vendor.
+    candidates_offset_top = [0, 20, 40, 60, 80, 100, 120]
+    candidates_offset_left = [0]
+    candidates_invert = [True, False]
+    candidates_speed = [4_000_000, 8_000_000, 12_000_000, 16_000_000, 24_000_000, 32_000_000]
+    candidates_size = [(240, 240), (240, 280), (240, 320)]
+    candidates_cs = [0, 1]
+    candidates_no_rst = [False, True]
+    candidates_no_backlight = [base_args.no_backlight, True] if not base_args.no_backlight else [True]
+
+    print("\nSCAN MODE")
+    print("- Watch the screen; when you see ANYTHING, note the printed config.")
+    print("- If you never see anything, the issue is likely wiring/power/CS/DC/RST.")
+
+    trial = 0
+    for width, height in candidates_size:
+        for rotation in candidates_rotation:
+            for offset_top in candidates_offset_top:
+                for offset_left in candidates_offset_left:
+                    for invert in candidates_invert:
+                        for speed in candidates_speed:
+                            for cs in candidates_cs:
+                                for no_rst in candidates_no_rst:
+                                    for no_backlight in candidates_no_backlight:
+                                        trial += 1
+
+                                        args = argparse.Namespace(**vars(base_args))
+                                        args.width = width
+                                        args.height = height
+                                        args.rotation = rotation
+                                        args.offset_top = offset_top
+                                        args.offset_left = offset_left
+                                        args.invert = invert
+                                        args.speed = speed
+                                        args.cs = cs
+                                        args.no_rst = no_rst
+                                        args.no_backlight = no_backlight
+
+                                        print(
+                                            f"\n[Trial {trial}] size={width}x{height} rot={rotation} top={offset_top} inv={invert} speed={speed/1_000_000:.0f}MHz cs={cs} no_rst={no_rst} no_bl={no_backlight}"
+                                        )
+                                        try:
+                                            display = _init_display(args)
+                                            img = Image.new('RGB', (display.width, display.height), color=(255, 0, 0))
+                                            draw = ImageDraw.Draw(img)
+                                            try:
+                                                font = ImageFont.truetype(
+                                                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18
+                                                )
+                                            except Exception:
+                                                font = ImageFont.load_default()
+
+                                            draw.rectangle([0, 0, display.width, 30], fill=(0, 0, 0))
+                                            draw.text(
+                                                (5, 6),
+                                                f"{width}x{height} r{rotation} t{offset_top} inv{int(invert)} {speed//1_000_000}M cs{cs} rst{int(not no_rst)}",
+                                                font=font,
+                                                fill=(255, 255, 255),
+                                            )
+                                            display.display(img)
+                                            time.sleep(2)
+                                        except Exception as e:
+                                            print(f"  init/display failed: {e}")
+
+def test_display(args: argparse.Namespace) -> bool:
+    """Test ST7789V3 display with various patterns and colors"""
     
-    print("Initializing ST7789 display...")
-    
-    # Create display instance
-    # Adjust these parameters based on your specific display:
-    # - width, height: Display resolution (240x240 or 240x320)
-    # - rotation: 0, 90, 180, or 270 degrees
-    # - port, cs, dc, backlight, rst: SPI and GPIO pins
+    print("Initializing ST7789V3 display...")
+    print("ST7789V3 Driver - Enhanced version with built-in charge pump")
     
     try:
-        display = st7789.ST7789(
-            rotation=90,  # Adjust rotation (0, 90, 180, 270)
-            port=0,       # SPI port (SPI0)
-            cs=0,         # Chip select CE0 (GPIO 8, Pin 24)
-            dc=25,        # Data/Command pin (GPIO 25, Pin 22)
-            backlight=18, # Backlight pin (GPIO 18, Pin 12)
-            rst=24,       # Reset pin (GPIO 24, Pin 18)
-            spi_speed_hz=80 * 1000000  # 80 MHz SPI speed
-        )
+        display = _init_display(args)
         
-        print("✓ Display initialized successfully!")
+        print("✓ ST7789V3 display initialized successfully!")
         print(f"  Resolution: {display.width}x{display.height}")
+        print(f"  Driver: ST7789V3 (Enhanced)")
+        print(f"  SPI Speed: {args.speed/1_000_000:.0f} MHz")
+        if args.offset_left is not None or args.offset_top is not None:
+            print(f"  Offset: left={args.offset_left or 0}, top={args.offset_top or 0}")
         
     except Exception as e:
-        print(f"✗ Failed to initialize display: {e}")
-        print("\nTroubleshooting:")
+        print(f"✗ Failed to initialize ST7789V3 display: {e}")
+        print("\nST7789V3 Troubleshooting:")
         print("1. Check SPI is enabled: sudo raspi-config → Interface Options → SPI")
-        print("2. Verify wiring connections")
-        print("3. Check GPIO pins match your setup")
+        print("2. Verify ST7789V3 wiring connections:")
+        print("   - VCC  → 3.3V (Pin 1 or 17)")
+        print("   - GND  → GND (Pin 6, 9, 14, 20, 25, 30, 34, or 39)")
+        print("   - SCL  → SCLK (GPIO 11, Pin 23)")
+        print("   - SDA  → MOSI (GPIO 10, Pin 19)")
+        print(f"   - RES  → GPIO {args.rst} (configurable)")
+        print(f"   - DC   → GPIO {args.dc} (configurable)")
+        print("   - CS   → CE0 (GPIO 8, Pin 24)  [or CE1 (GPIO 7, Pin 26)]")
+        print(f"   - BLK  → GPIO {args.backlight} (configurable)")
+        print("3. Check GPIO pins match your ST7789V3 module")
+        print("4. Verify 3.3V power supply (ST7789V3 uses internal charge pump)")
         return False
     
     # Get display dimensions
@@ -53,6 +273,14 @@ def test_display():
     print("\n" + "="*50)
     print("Starting Display Tests")
     print("="*50)
+    
+    # Test 0: Initial clear and white screen to verify display is working
+    print("\n[Test 0/6] Initial display test (WHITE screen)...")
+    print("  If you see a WHITE screen, the display is working!")
+    img = Image.new('RGB', (WIDTH, HEIGHT), color=(255, 255, 255))
+    display.display(img)
+    time.sleep(2)
+    print("  ✓ If screen is white, display is functional")
     
     # Test 1: Solid Colors
     print("\n[Test 1/6] Testing solid colors...")
@@ -119,10 +347,11 @@ def test_display():
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
     
-    draw.text((10, 10), "ST7789 Display", font=font_large, fill=(255, 255, 255))
+    draw.text((10, 10), "ST7789V3 Display", font=font_large, fill=(255, 255, 255))
     draw.text((10, 50), "Test Successful!", font=font_small, fill=(0, 255, 0))
     draw.text((10, 80), f"Resolution: {WIDTH}x{HEIGHT}", font=font_small, fill=(255, 255, 0))
     draw.text((10, 110), "Raspberry Pi 3", font=font_small, fill=(255, 100, 255))
+    draw.text((10, 140), "Driver: ST7789V3", font=font_small, fill=(100, 255, 255))
     draw.text((10, HEIGHT - 30), "SPI Display Working!", font=font_small, fill=(0, 255, 255))
     
     display.display(img)
@@ -188,20 +417,12 @@ def test_display():
     return True
 
 
-def quick_test():
-    """Quick test - just display a simple message"""
-    print("Running quick test...")
+def quick_test(args: argparse.Namespace) -> bool:
+    """Quick test - just display a simple message on ST7789V3"""
+    print("Running ST7789V3 quick test...")
     
     try:
-        display = st7789.ST7789(
-            rotation=90,
-            port=0,
-            cs=0,         # CE0 (GPIO 8, Pin 24)
-            dc=25,        # GPIO 25, Pin 22
-            backlight=18, # GPIO 18, Pin 12
-            rst=24,       # GPIO 24, Pin 18
-            spi_speed_hz=80 * 1000000
-        )
+        display = _init_display(args)
         
         img = Image.new('RGB', (display.width, display.height), color=(0, 0, 255))
         draw = ImageDraw.Draw(img)
@@ -211,31 +432,39 @@ def quick_test():
         except:
             font = ImageFont.load_default()
         
-        draw.text((20, display.height//2 - 20), "DISPLAY OK!", font=font, fill=(255, 255, 255))
+        draw.text((10, display.height//2 - 40), "ST7789V3", font=font, fill=(255, 255, 0))
+        draw.text((10, display.height//2 + 10), "DISPLAY OK!", font=font, fill=(255, 255, 255))
         display.display(img)
         
-        print("✓ Quick test successful!")
+        print("✓ ST7789V3 quick test successful!")
         return True
         
     except Exception as e:
-        print(f"✗ Quick test failed: {e}")
+        print(f"✗ ST7789V3 quick test failed: {e}")
         return False
 
 
 if __name__ == "__main__":
-    print("="*50)
-    print("ST7789 Display Test Script")
-    print("="*50)
-    print("\nOptions:")
-    print("1. Full test suite (recommended)")
-    print("2. Quick test")
-    print("3. Exit")
-    
-    choice = input("\nEnter choice (1-3) [default: 1]: ").strip() or "1"
-    
-    if choice == "1":
-        test_display()
-    elif choice == "2":
-        quick_test()
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print("ST7789/ST7789V3 Display Test Script")
+    print("=" * 50)
+    backlight_label = "none" if args.no_backlight else str(_phys_to_bcm(args.backlight_phys) if args.backlight_phys is not None else args.backlight)
+    dc_label = str(_phys_to_bcm(args.dc_phys)) if args.dc_phys is not None else str(args.dc)
+    rst_label = str(_phys_to_bcm(args.rst_phys)) if args.rst_phys is not None else str(args.rst)
+    print(
+        f"Using (BCM): rotation={args.rotation}, port={args.port}, cs={args.cs}, dc={dc_label}, rst={rst_label}, backlight={backlight_label}, speed={args.speed}"
+    )
+    if args.width and args.height:
+        print(f"Panel override: {args.width}x{args.height}")
+    if args.offset_left is not None or args.offset_top is not None:
+        print(f"Offset: left={args.offset_left or 0}, top={args.offset_top or 0}")
+
+    if args.scan:
+        scan_for_working_config(args)
+    elif args.quick:
+        quick_test(args)
     else:
-        print("Exiting...")
+        test_display(args)

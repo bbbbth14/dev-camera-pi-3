@@ -5,12 +5,14 @@ Shows real-time attendance status from the face recognition system
 """
 
 import time
-import st7789
+import argparse
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 import os
 import csv
 from attendance_tracker import AttendanceTracker
+
+from st7789_raw_driver import RawST7789, phys_to_bcm
 
 # Display configuration
 DISPLAY_WIDTH = 240
@@ -29,20 +31,52 @@ BORDER_COLOR = (100, 150, 200)
 class AttendanceDisplay:
     """Display attendance information on ST7789 screen"""
     
-    def __init__(self):
+    def __init__(self, args: argparse.Namespace):
         """Initialize display"""
         print("Initializing ST7789 display...")
-        
-        # Initialize display with correct pins
-        self.display = st7789.ST7789(
-            rotation=90,
-            port=0,
-            cs=0,         # CE0 (GPIO 8, Pin 24)
-            dc=25,        # GPIO 25, Pin 22
-            backlight=18, # GPIO 18, Pin 12
-            rst=24,       # GPIO 24, Pin 18
-            spi_speed_hz=80 * 1000000
-        )
+
+        # Prefer the raw backend (this matches the init that worked for your panel).
+        # Defaults are the known-good wiring:
+        #   CS=CE0, DC=physical pin 22 (GPIO25), RST=physical pin 18 (GPIO24)
+        # Backlight can be tied to 3.3V and does not need GPIO control.
+        try:
+            dc_gpio = phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc
+            rst_gpio = None if args.no_rst else (phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst)
+
+            self.display = RawST7789(
+                port=args.port,
+                cs=args.cs,
+                dc=dc_gpio,
+                rst=rst_gpio,
+                speed=args.speed,
+                spi_mode=args.spi_mode,
+                width=args.width,
+                height=args.height,
+                offset_left=args.offset_left,
+                offset_top=args.offset_top,
+                rotation=args.rotation,
+                invert=args.invert,
+            )
+            self._raw_backend = True
+        except Exception as e:
+            print(f"[WARNING] Raw ST7789 init failed: {e}")
+            print("[INFO] Falling back to `st7789` library...")
+            import st7789
+
+            self.display = st7789.ST7789(
+                width=args.width,
+                height=args.height,
+                rotation=args.rotation,
+                port=args.port,
+                cs=args.cs,
+                dc=(phys_to_bcm(args.dc_phys) if args.dc_phys is not None else args.dc),
+                rst=(phys_to_bcm(args.rst_phys) if args.rst_phys is not None else args.rst),
+                spi_speed_hz=args.speed,
+                offset_left=args.offset_left,
+                offset_top=args.offset_top,
+                invert=args.invert,
+            )
+            self._raw_backend = False
         
         # Load fonts
         try:
@@ -118,8 +152,12 @@ class AttendanceDisplay:
             max_users = 5
             
             # Sort by most recent activity
-            sorted_users = sorted(user_status.items(), 
-                                key=lambda x: x[1].get('last_time', ''), reverse=True)
+            def _sort_key(item):
+                info = item[1] or {}
+                # last_time can exist but be None -> keep key always comparable
+                return info.get('last_time') or ''
+
+            sorted_users = sorted(user_status.items(), key=_sort_key, reverse=True)
             
             for name, status_info in sorted_users[:max_users]:
                 self.draw_user_status(draw, y_pos, name, status_info)
@@ -169,9 +207,39 @@ def main():
     print("="*50)
     print("ST7789 Attendance Display")
     print("="*50)
-    
-    display = AttendanceDisplay()
-    display.run(update_interval=2)
+
+    parser = argparse.ArgumentParser(description="ST7789 Attendance Display")
+    parser.add_argument("--update-interval", type=float, default=2.0)
+
+    # SPI
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--cs", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--speed", type=int, default=4_000_000)
+    parser.add_argument("--spi-mode", type=int, default=0, choices=[0, 1, 2, 3])
+
+    # Panel
+    parser.add_argument("--width", type=int, default=240)
+    parser.add_argument("--height", type=int, default=240)
+    parser.add_argument("--offset-left", type=int, default=0)
+    parser.add_argument("--offset-top", type=int, default=0)
+    parser.add_argument("--rotation", type=int, default=90, choices=[0, 90, 180, 270])
+
+    inv = parser.add_mutually_exclusive_group()
+    inv.add_argument("--invert", dest="invert", action="store_true")
+    inv.add_argument("--no-invert", dest="invert", action="store_false")
+    parser.set_defaults(invert=True)
+
+    # GPIO
+    parser.add_argument("--dc", type=int, default=25, help="BCM GPIO")
+    parser.add_argument("--rst", type=int, default=24, help="BCM GPIO")
+    parser.add_argument("--no-rst", action="store_true")
+    parser.add_argument("--dc-phys", type=int, default=22, help="physical pin for DC (default: 22)")
+    parser.add_argument("--rst-phys", type=int, default=18, help="physical pin for RST (default: 18)")
+
+    args = parser.parse_args()
+
+    display = AttendanceDisplay(args)
+    display.run(update_interval=args.update_interval)
 
 
 if __name__ == "__main__":

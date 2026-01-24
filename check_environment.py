@@ -101,25 +101,59 @@ print("\n6. Testing ST7789 initialization...")
 try:
     import st7789
     from PIL import Image, ImageDraw
-    
-    display = st7789.ST7789(
-        rotation=90,
-        port=0,
-        cs=0,
-        dc=25,
-        backlight=18,
-        rst=24,
-        spi_speed_hz=80 * 1000000
-    )
+
+    # Default wiring in this repo:
+    #   CS  = CE0 (GPIO 8 / physical pin 24)
+    #   DC  = GPIO 25 / physical pin 22
+    #   RST = GPIO 24 / physical pin 18
+    #   BLK = GPIO 18 / physical pin 12
+    # If your display BLK is tied to 3.3V (physical pin 1), you may NOT have a
+    # backlight GPIO at all. In that case, the first init (with backlight=18)
+    # can fail on some setups due to GPIO permissions; we retry without it.
+
+    # Try common panel sizes; some modules are 240x280 (1.69")
+    panel_sizes = [(240, 280), (240, 240), (240, 320)]
+
+    last_error = None
+    display = None
+    for (w, h) in panel_sizes:
+        init_kwargs = dict(
+            width=w,
+            height=h,
+            rotation=90,
+            port=0,
+            cs=0,
+            dc=25,
+            rst=24,
+            invert=True,
+            spi_speed_hz=4 * 1000000,
+            offset_left=0,
+            offset_top=0,
+        )
+
+        try:
+            display = st7789.ST7789(backlight=18, **init_kwargs)
+            break
+        except Exception as e:
+            last_error = e
+            try:
+                display = st7789.ST7789(**init_kwargs)
+                break
+            except Exception as e2:
+                last_error = e2
+                display = None
+
+    if display is None:
+        raise last_error
     
     print(f"   ✓ ST7789 initialized successfully")
     print(f"   Display size: {display.width}x{display.height}")
     
     # Try to send data to display
     print("\n7. Testing data transfer to display...")
-    img = Image.new('RGB', (240, 240), color=(255, 0, 0))
+    img = Image.new('RGB', (display.width, display.height), color=(255, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([50, 50, 190, 190], fill=(255, 255, 255))
+    draw.rectangle([50, 50, min(190, display.width - 50), min(190, display.height - 50)], fill=(255, 255, 255))
     
     display.display(img)
     print("   ✓ Data sent to display")
@@ -131,7 +165,7 @@ try:
     time.sleep(5)
     
     # Clear
-    img = Image.new('RGB', (240, 240), color=(0, 0, 0))
+    img = Image.new('RGB', (display.width, display.height), color=(0, 0, 0))
     display.display(img)
     
 except Exception as e:
