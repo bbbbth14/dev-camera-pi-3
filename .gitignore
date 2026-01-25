@@ -12,6 +12,7 @@ ENV/
 data/faces/*.pkl
 data/images/*
 data/*.csv
+data/attendance.xlsx
 data/last_event.json
 data/*.bak-*
 data/*.csv.bak-*

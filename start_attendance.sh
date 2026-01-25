@@ -47,6 +47,12 @@ echo "  ✓ Automatic late time and overtime tracking"
 echo "  ✓ Per-user monthly sheets with statistics"
 echo ""
 
+# Refresh the Excel "User Directory" summary so it stays up-to-date.
+python3 - <<'PY' >/dev/null 2>&1 || true
+from attendance_tracker import AttendanceTracker
+AttendanceTracker().update_user_directory()
+PY
+
 # Check WiFi connection
 echo "🔍 Checking network connectivity..."
 if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
